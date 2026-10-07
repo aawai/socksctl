@@ -16,7 +16,8 @@ case "${1:-}" in
       current) printf '%s\n' "${FAKE_CURRENT:-p}" ;;
       tunnel-state)
         printf '%s\n' "${FAKE_TUNNEL_STATE:-READY}"
-        [[ "${FAKE_TUNNEL_STATE:-READY}" == UNKNOWN ]] && exit 4
+        if [[ "${FAKE_TUNNEL_STATE:-READY}" == UNKNOWN ]]; then exit 4; fi
+        exit 0
         ;;
       activation)
         profile="${3:-p}"
@@ -58,6 +59,7 @@ teardown() {
 
 @test "activate/deactivate restores unset, unexported, exported and empty values exactly" {
   run env PATH="$SANDBOX/fakebin:$PATH" INIT="$SANDBOX/init.sh" bash -c '
+    set -e
     set -u
     unset all_proxy
     ALL_PROXY=""
@@ -70,7 +72,6 @@ teardown() {
 
     # shellcheck disable=SC1090
     source "$INIT"
-    set -x
     socksctl activate p
 
     [[ "$all_proxy" == "socks5h://127.0.0.1:18080" ]]
@@ -101,6 +102,7 @@ teardown() {
 
 @test "profile switch keeps the first snapshot until final deactivate" {
   run env PATH="$SANDBOX/fakebin:$PATH" INIT="$SANDBOX/init.sh" bash -c '
+    set -e
     export ALL_PROXY=original
     source "$INIT"
     socksctl activate p
@@ -116,6 +118,7 @@ teardown() {
 
 @test "readonly managed variable fails preflight with no partial shell mutation" {
   run env PATH="$SANDBOX/fakebin:$PATH" INIT="$SANDBOX/init.sh" bash -c '
+    set -e
     readonly HTTP_PROXY=locked
     export ALL_PROXY=before
     source "$INIT"
@@ -130,6 +133,7 @@ teardown() {
 
 @test "apply failure rolls back transaction and clears a first failed snapshot" {
   run env PATH="$SANDBOX/fakebin:$PATH" INIT="$SANDBOX/init.sh" bash -c '
+    set -e
     export ALL_PROXY=before
     source "$INIT"
     __socksctl_assign_exported() {
@@ -160,6 +164,7 @@ teardown() {
 
 @test "AUTO_ACTIVATE none leaves shell unchanged while shell mode activates" {
   run env PATH="$SANDBOX/fakebin:$PATH" INIT="$SANDBOX/init.sh" FAKE_AUTO=none bash -c '
+    set -e
     export ALL_PROXY=before
     source "$INIT"
     socksctl start p
@@ -169,9 +174,9 @@ teardown() {
   [ "$status" -eq 0 ]
 
   run env PATH="$SANDBOX/fakebin:$PATH" INIT="$SANDBOX/init.sh" FAKE_AUTO=shell bash -c '
+    set -e
     export ALL_PROXY=before
     source "$INIT"
-    set -x
     socksctl start p
     [[ "$ALL_PROXY" == "socks5h://127.0.0.1:18080" ]]
     [[ "$SOCKSCTL_ACTIVE_PROFILE" == p ]]
@@ -182,6 +187,7 @@ teardown() {
 
 @test "auto activation failure leaves READY tunnel but rolls shell back and returns 1" {
   run env PATH="$SANDBOX/fakebin:$PATH" INIT="$SANDBOX/init.sh" FAKE_AUTO=shell FAKE_NC_RC=1 bash -c '
+    set -e
     export ALL_PROXY=before
     source "$INIT"
     set +e
@@ -198,6 +204,7 @@ teardown() {
 
 @test "stop active profile deactivates; stop other profile does not" {
   run env PATH="$SANDBOX/fakebin:$PATH" INIT="$SANDBOX/init.sh" bash -c '
+    set -e
     export ALL_PROXY=before
     source "$INIT"
     socksctl activate p
@@ -213,6 +220,7 @@ teardown() {
 
 @test "restart active failure deactivates and successful restart reapplies" {
   run env PATH="$SANDBOX/fakebin:$PATH" INIT="$SANDBOX/init.sh" FAKE_RESTART_RC=1 bash -c '
+    set -e
     export ALL_PROXY=before
     source "$INIT"
     socksctl activate p
@@ -227,6 +235,7 @@ teardown() {
   [ "$status" -eq 0 ]
 
   run env PATH="$SANDBOX/fakebin:$PATH" INIT="$SANDBOX/init.sh" FAKE_RESTART_RC=0 bash -c '
+    set -e
     export ALL_PROXY=before
     source "$INIT"
     socksctl activate p
@@ -241,6 +250,7 @@ teardown() {
 
 @test "stop-all deactivates and generated shell init works under set -u" {
   run env PATH="$SANDBOX/fakebin:$PATH" INIT="$SANDBOX/init.sh" bash -c '
+    set -e
     set -u
     export ALL_PROXY=before
     source "$INIT"
@@ -254,6 +264,7 @@ teardown() {
 
 @test "child shell does not inherit a false ACTIVE marker" {
   run env PATH="$SANDBOX/fakebin:$PATH" INIT="$SANDBOX/init.sh" bash -c '
+    set -e
     source "$INIT"
     socksctl activate p
     bash -c "[[ -z \"\${SOCKSCTL_ACTIVE_PROFILE-}\" ]]"
@@ -263,6 +274,7 @@ teardown() {
 
 @test "status wrapper passes the shell-local marker only for the backend query" {
   run env PATH="$SANDBOX/fakebin:$PATH" INIT="$SANDBOX/init.sh" bash -c '
+    set -e
     source "$INIT"
     socksctl activate p
     out="$(socksctl status p)"

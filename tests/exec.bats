@@ -17,6 +17,7 @@ teardown() {
 @test "exec sets SOCKS env in child and leaves parent env unchanged" {
   export ALL_PROXY="parent"
   run "$SUT" exec p -- bash -c '
+    set -e
     [[ "$all_proxy" == "socks5h://127.0.0.1:18080" ]]
     [[ "$ALL_PROXY" == "$all_proxy" ]]
     [[ "$socks_proxy" == "$all_proxy" ]]
@@ -34,7 +35,7 @@ teardown() {
 }
 
 @test "exec returns 127 for command not found" {
-  run "$SUT" exec p -- definitely-not-a-command
+  run -127 "$SUT" exec p -- definitely-not-a-command
   [ "$status" -eq 127 ]
 }
 

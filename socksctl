@@ -1,157 +1,449 @@
 #!/usr/bin/env bash
 
 set -u
+umask 077
 
-# ============================================================
-# socksctl
-# Simple multi-profile SOCKS5 over SSH manager using autossh
-# ============================================================
+# socksctl - Linux/Bash SOCKS5-over-SSH manager.
+# Runtime target: Linux, Bash >= 4, OpenSSH, autossh.
+
+EXIT_OPERATIONAL=1
+EXIT_USAGE=2
+EXIT_DEPENDENCY=3
+EXIT_STATE=4
+EXIT_EXEC_PRECONDITION=125
 
 CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
 STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}"
-
 CONFIG_DIR="$CONFIG_HOME/socksctl"
 PROFILE_DIR="$CONFIG_DIR/profiles"
 CURRENT_FILE="$CONFIG_DIR/current"
-
 STATE_DIR="$STATE_HOME/socksctl"
 
 DEFAULT_USER="ubuntu"
 DEFAULT_SSH_PORT="22"
-DEFAULT_BIND="127.0.0.1"
-DEFAULT_SOCKS_PORT="18080"
+DEFAULT_LISTEN_HOST="127.0.0.1"
+DEFAULT_LISTEN_PORT="18080"
+DEFAULT_AUTO_ACTIVATE="shell"
 
-SERVER_ALIVE_INTERVAL="30"
-SERVER_ALIVE_COUNT_MAX="3"
-CONNECT_TIMEOUT="10"
+SERVER_ALIVE_INTERVAL="${SOCKSCTL_SERVER_ALIVE_INTERVAL:-30}"
+SERVER_ALIVE_COUNT_MAX="${SOCKSCTL_SERVER_ALIVE_COUNT_MAX:-3}"
+CONNECT_TIMEOUT="${SOCKSCTL_CONNECT_TIMEOUT:-10}"
+START_TIMEOUT="${SOCKSCTL_START_TIMEOUT:-15}"
+STOP_TIMEOUT="${SOCKSCTL_STOP_TIMEOUT:-3}"
+LOCK_TIMEOUT="${SOCKSCTL_LOCK_TIMEOUT:-5}"
+POLL_INTERVAL="${SOCKSCTL_POLL_INTERVAL:-0.2}"
+PROC_ROOT="${SOCKSCTL_PROC_ROOT:-/proc}"
 
-mkdir -p "$PROFILE_DIR" "$STATE_DIR"
-chmod 700 "$CONFIG_DIR" "$PROFILE_DIR" "$STATE_DIR" 2>/dev/null || true
+PROFILE_VERSION=""
+HOST=""
+USER_NAME=""
+SSH_PORT=""
+KEY=""
+LISTEN_HOST=""
+LISTEN_PORT=""
+CLIENT_HOST=""
+CLIENT_PORT=""
+AUTO_ACTIVATE=""
 
-die() {
-    echo "ERROR: $*" >&2
-    exit 1
+R_PID=""
+R_PROCESS_START_ID=""
+R_STARTED_AT=""
+R_PHASE=""
+R_HOST=""
+R_USER_NAME=""
+R_SSH_PORT=""
+R_KEY=""
+R_LISTEN_HOST=""
+R_LISTEN_PORT=""
+R_CLIENT_HOST=""
+R_CLIENT_PORT=""
+R_AUTO_ACTIVATE=""
+
+TUNNEL_STATE="STOPPED"
+IDENTITY_STATE="MISSING"
+SSH_CHILD_PID=""
+
+fatal() {
+    local code="$1"
+    shift
+    printf 'ERROR: %s\n' "$*" >&2
+    exit "$code"
+}
+
+usage_error() {
+    printf 'ERROR: %s\n' "$*" >&2
+    printf 'Run "socksctl help" for usage.\n' >&2
+    exit "$EXIT_USAGE"
 }
 
 command_exists() {
     command -v "$1" >/dev/null 2>&1
 }
 
-check_start_dependencies() {
-    command_exists ssh || die "ssh 未安装"
-    command_exists autossh || die "autossh 未安装，请执行: sudo apt install autossh"
+require_commands() {
+    local cmd
+    local missing=()
+    for cmd in "$@"; do
+        command_exists "$cmd" || missing+=("$cmd")
+    done
+    if ((${#missing[@]})); then
+        printf 'ERROR: missing required command(s): %s\n' "${missing[*]}" >&2
+        return "$EXIT_DEPENDENCY"
+    fi
 }
 
-check_test_dependencies() {
-    command_exists curl || die "curl 未安装"
+check_platform() {
+    if ((BASH_VERSINFO[0] < 4)); then
+        printf 'ERROR: Bash >= 4 is required.\n' >&2
+        return "$EXIT_DEPENDENCY"
+    fi
+    if [[ "$(uname -s 2>/dev/null || true)" != "Linux" ]]; then
+        printf 'ERROR: socksctl runtime is Linux-only.\n' >&2
+        return "$EXIT_DEPENDENCY"
+    fi
+}
+
+ensure_dirs() {
+    mkdir -p "$PROFILE_DIR" "$STATE_DIR" || fatal "$EXIT_OPERATIONAL" "cannot create state directories"
+    chmod 700 "$CONFIG_DIR" "$PROFILE_DIR" "$STATE_DIR" 2>/dev/null || true
 }
 
 valid_profile_name() {
-    [[ "$1" =~ ^[A-Za-z0-9._-]+$ ]]
+    [[ "${1:-}" =~ ^[A-Za-z0-9._-]+$ ]]
 }
 
 profile_file() {
-    echo "$PROFILE_DIR/$1.conf"
+    printf '%s/%s.conf\n' "$PROFILE_DIR" "$1"
 }
 
-pid_file() {
-    echo "$STATE_DIR/$1.pid"
+state_file() {
+    printf '%s/%s.state\n' "$STATE_DIR" "$1"
+}
+
+lock_file() {
+    printf '%s/%s.lock\n' "$STATE_DIR" "$1"
 }
 
 log_file() {
-    echo "$STATE_DIR/$1.log"
+    printf '%s/%s.log\n' "$STATE_DIR" "$1"
 }
 
 profile_exists() {
+    valid_profile_name "$1" || return 1
     [[ -f "$(profile_file "$1")" ]]
 }
 
-get_current_profile() {
-    if [[ -f "$CURRENT_FILE" ]]; then
-        local name
-        name="$(cat "$CURRENT_FILE" 2>/dev/null || true)"
-
-        if [[ -n "$name" ]] && profile_exists "$name"; then
-            echo "$name"
-            return 0
-        fi
+atomic_write_file() {
+    local path="$1"
+    local mode="$2"
+    local content="$3"
+    local dir tmp
+    dir="$(dirname "$path")"
+    mkdir -p "$dir" || return 1
+    tmp="$(mktemp "$dir/.socksctl.tmp.XXXXXX")" || return 1
+    if ! printf '%s' "$content" >"$tmp"; then
+        rm -f "$tmp"
+        return 1
     fi
+    chmod "$mode" "$tmp" || {
+        rm -f "$tmp"
+        return 1
+    }
+    if ! mv -f "$tmp" "$path"; then
+        rm -f "$tmp"
+        return 1
+    fi
+}
 
-    return 1
+atomic_remove_file() {
+    local path="$1"
+    rm -f "$path"
+}
+
+get_raw_current() {
+    [[ -f "$CURRENT_FILE" ]] || return 1
+    local value
+    IFS= read -r value <"$CURRENT_FILE" || true
+    [[ -n "$value" ]] || return 1
+    printf '%s\n' "$value"
+}
+
+get_current_profile() {
+    local name
+    name="$(get_raw_current 2>/dev/null || true)"
+    [[ -n "$name" ]] || return 1
+    profile_exists "$name" || return 1
+    printf '%s\n' "$name"
 }
 
 set_current_profile() {
     local name="$1"
-    printf '%s\n' "$name" > "$CURRENT_FILE"
-    chmod 600 "$CURRENT_FILE"
+    atomic_write_file "$CURRENT_FILE" 600 "$(printf '%s\n' "$name")" ||
+        fatal "$EXIT_OPERATIONAL" "cannot update current profile"
 }
 
 first_profile() {
     local file
-
+    local LC_ALL=C
     for file in "$PROFILE_DIR"/*.conf; do
         [[ -e "$file" ]] || continue
         basename "$file" .conf
         return 0
     done
-
     return 1
 }
 
+expand_path() {
+    local value="$1"
+    if [[ "$value" == "~" ]]; then
+        printf '%s\n' "$HOME"
+    elif [[ "$value" == \~/* ]]; then
+        printf '%s/%s\n' "$HOME" "${value:2}"
+    else
+        printf '%s\n' "$value"
+    fi
+}
+
+default_client_host() {
+    case "$1" in
+        0.0.0.0|'*') printf '127.0.0.1\n' ;;
+        ::) printf '::1\n' ;;
+        *) printf '%s\n' "$1" ;;
+    esac
+}
+
+probe_host_for_listener() {
+    default_client_host "$1"
+}
+
+format_bind_spec() {
+    local host="$1" port="$2"
+    if [[ "$host" == *:* && "$host" != \[*\] ]]; then
+        printf '[%s]:%s\n' "$host" "$port"
+    else
+        printf '%s:%s\n' "$host" "$port"
+    fi
+}
+
+format_socks_uri() {
+    local host="$1" port="$2"
+    if [[ "$host" == *:* && "$host" != \[*\] ]]; then
+        printf 'socks5h://[%s]:%s\n' "$host" "$port"
+    else
+        printf 'socks5h://%s:%s\n' "$host" "$port"
+    fi
+}
+
+format_endpoint() {
+    format_bind_spec "$1" "$2"
+}
+
+is_valid_port() {
+    local value="${1:-}"
+    [[ "$value" =~ ^[0-9]+$ ]] || return 1
+    ((10#$value >= 1 && 10#$value <= 65535))
+}
+
+contains_forbidden_text_chars() {
+    local value="$1"
+    [[ "$value" == *$'\n'* || "$value" == *$'\r'* ]]
+}
+
+contains_tab() {
+    [[ "$1" == *$'\t'* ]]
+}
+
+validate_profile_values() {
+    local require_key_file="${1:-no}"
+    [[ -n "$HOST" ]] || { printf 'HOST is required\n' >&2; return "$EXIT_USAGE"; }
+    [[ -n "$USER_NAME" ]] || { printf 'USER_NAME is required\n' >&2; return "$EXIT_USAGE"; }
+    [[ -n "$LISTEN_HOST" ]] || { printf 'LISTEN_HOST is required\n' >&2; return "$EXIT_USAGE"; }
+    [[ -n "$CLIENT_HOST" ]] || { printf 'CLIENT_HOST is required\n' >&2; return "$EXIT_USAGE"; }
+
+    local text
+    for text in "$HOST" "$USER_NAME" "$KEY" "$LISTEN_HOST" "$CLIENT_HOST" "$AUTO_ACTIVATE"; do
+        contains_forbidden_text_chars "$text" && {
+            printf 'profile values must not contain LF/CR\n' >&2
+            return "$EXIT_USAGE"
+        }
+    done
+    for text in "$HOST" "$USER_NAME" "$LISTEN_HOST" "$CLIENT_HOST"; do
+        contains_tab "$text" && {
+            printf 'HOST/USER_NAME/LISTEN_HOST/CLIENT_HOST must not contain tabs\n' >&2
+            return "$EXIT_USAGE"
+        }
+    done
+
+    is_valid_port "$SSH_PORT" || { printf 'SSH_PORT must be an integer in 1..65535\n' >&2; return "$EXIT_USAGE"; }
+    is_valid_port "$LISTEN_PORT" || { printf 'LISTEN_PORT must be an integer in 1..65535\n' >&2; return "$EXIT_USAGE"; }
+    is_valid_port "$CLIENT_PORT" || { printf 'CLIENT_PORT must be an integer in 1..65535\n' >&2; return "$EXIT_USAGE"; }
+
+    case "$AUTO_ACTIVATE" in
+        none|shell) ;;
+        *) printf 'AUTO_ACTIVATE must be "none" or "shell"\n' >&2; return "$EXIT_USAGE" ;;
+    esac
+
+    if [[ -n "$KEY" ]]; then
+        KEY="$(expand_path "$KEY")"
+        if [[ "$require_key_file" == "yes" && ! -f "$KEY" ]]; then
+            printf 'private key is not a regular file: %s\n' "$KEY" >&2
+            return "$EXIT_USAGE"
+        fi
+    fi
+}
+
 reset_config() {
+    PROFILE_VERSION="2"
     HOST=""
     USER_NAME="$DEFAULT_USER"
     SSH_PORT="$DEFAULT_SSH_PORT"
     KEY=""
-    BIND="$DEFAULT_BIND"
-    PORT="$DEFAULT_SOCKS_PORT"
+    LISTEN_HOST="$DEFAULT_LISTEN_HOST"
+    LISTEN_PORT="$DEFAULT_LISTEN_PORT"
+    CLIENT_HOST="$DEFAULT_LISTEN_HOST"
+    CLIENT_PORT="$DEFAULT_LISTEN_PORT"
+    AUTO_ACTIVATE="$DEFAULT_AUTO_ACTIVATE"
+}
+
+file_contains_nul() {
+    local file="$1"
+    LC_ALL=C od -An -tx1 "$file" 2>/dev/null | grep -qw '00'
+}
+
+load_v2_profile() {
+    local file="$1"
+    local line key value
+    local -A seen=()
+
+    file_contains_nul "$file" && {
+        printf 'invalid profile: NUL byte is not allowed\n' >&2
+        return "$EXIT_USAGE"
+    }
+
+    reset_config
+    PROFILE_VERSION=""
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ -n "$line" && "$line" == *=* ]] || {
+            printf 'invalid profile line: expected KEY=VALUE\n' >&2
+            return "$EXIT_USAGE"
+        }
+        [[ "$line" != *$'\r'* ]] || {
+            printf 'invalid profile: CR is not allowed\n' >&2
+            return "$EXIT_USAGE"
+        }
+        key="${line%%=*}"
+        value="${line#*=}"
+        case "$key" in
+            PROFILE_VERSION|HOST|USER_NAME|SSH_PORT|KEY|LISTEN_HOST|LISTEN_PORT|CLIENT_HOST|CLIENT_PORT|AUTO_ACTIVATE) ;;
+            *) printf 'invalid profile: unknown key %s\n' "$key" >&2; return "$EXIT_USAGE" ;;
+        esac
+        [[ -z "${seen[$key]+x}" ]] || {
+            printf 'invalid profile: duplicate key %s\n' "$key" >&2
+            return "$EXIT_USAGE"
+        }
+        seen["$key"]=1
+        printf -v "$key" '%s' "$value"
+    done <"$file"
+
+    local required
+    for required in PROFILE_VERSION HOST USER_NAME SSH_PORT KEY LISTEN_HOST LISTEN_PORT CLIENT_HOST CLIENT_PORT AUTO_ACTIVATE; do
+        [[ -n "${seen[$required]+x}" ]] || {
+            printf 'invalid profile: missing key %s\n' "$required" >&2
+            return "$EXIT_USAGE"
+        }
+    done
+    [[ "$PROFILE_VERSION" == "2" ]] || {
+        printf 'unsupported PROFILE_VERSION=%s\n' "$PROFILE_VERSION" >&2
+        return "$EXIT_USAGE"
+    }
+    validate_profile_values no
+}
+
+load_legacy_v1_profile() {
+    local file="$1"
+    local BIND="" PORT=""
+
+    reset_config
+    PROFILE_VERSION="1"
+    HOST=""
+    USER_NAME=""
+    SSH_PORT=""
+    KEY=""
+
+    # Legacy v1 compatibility only. v2 profiles are never sourced/eval'd.
+    # shellcheck disable=SC1090
+    source "$file"
+
+    LISTEN_HOST="$BIND"
+    LISTEN_PORT="$PORT"
+    CLIENT_HOST="$(default_client_host "$LISTEN_HOST")"
+    CLIENT_PORT="$LISTEN_PORT"
+    AUTO_ACTIVATE="none"
+
+    validate_profile_values no
 }
 
 load_profile() {
     local name="$1"
     local file
-
     file="$(profile_file "$name")"
+    [[ -f "$file" ]] || return "$EXIT_USAGE"
 
-    [[ -f "$file" ]] || return 1
-
-    reset_config
-
-    # Profile files are generated only by this script and chmod 600.
-    # shellcheck disable=SC1090
-    source "$file"
-
-    return 0
+    if grep -q '^PROFILE_VERSION=' "$file" 2>/dev/null; then
+        load_v2_profile "$file"
+    else
+        load_legacy_v1_profile "$file"
+    fi
 }
 
 save_profile() {
     local name="$1"
-    local file
-
-    file="$(profile_file "$name")"
-
-    {
-        printf 'HOST=%q\n' "$HOST"
-        printf 'USER_NAME=%q\n' "$USER_NAME"
-        printf 'SSH_PORT=%q\n' "$SSH_PORT"
-        printf 'KEY=%q\n' "$KEY"
-        printf 'BIND=%q\n' "$BIND"
-        printf 'PORT=%q\n' "$PORT"
-    } > "$file"
-
-    chmod 600 "$file"
+    validate_profile_values yes || return $?
+    PROFILE_VERSION="2"
+    local content
+    printf -v content '%s\n' \
+        'PROFILE_VERSION=2' \
+        "HOST=$HOST" \
+        "USER_NAME=$USER_NAME" \
+        "SSH_PORT=$SSH_PORT" \
+        "KEY=$KEY" \
+        "LISTEN_HOST=$LISTEN_HOST" \
+        "LISTEN_PORT=$LISTEN_PORT" \
+        "CLIENT_HOST=$CLIENT_HOST" \
+        "CLIENT_PORT=$CLIENT_PORT" \
+        "AUTO_ACTIVATE=$AUTO_ACTIVATE"
+    atomic_write_file "$(profile_file "$name")" 600 "$content" || {
+        printf 'cannot write profile %s\n' "$name" >&2
+        return "$EXIT_OPERATIONAL"
+    }
 }
 
-expand_path() {
-    local value="$1"
+suggest_listen_port() {
+    local candidate="$DEFAULT_LISTEN_PORT"
+    local file line value
+    local -A used=()
 
-    if [[ "$value" == "~" ]]; then
-        echo "$HOME"
-    elif [[ "$value" == "~/"* ]]; then
-        echo "$HOME/${value#~/}"
-    else
-        echo "$value"
-    fi
+    for file in "$PROFILE_DIR"/*.conf; do
+        [[ -e "$file" ]] || continue
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            case "$line" in
+                LISTEN_PORT=*|PORT=*)
+                    value="${line#*=}"
+                    [[ "$value" =~ ^[0-9]+$ ]] && used["$value"]=1
+                    ;;
+            esac
+        done <"$file"
+    done
+
+    while ((10#$candidate <= 65535)); do
+        if [[ -z "${used[$candidate]+x}" ]]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+        candidate=$((10#$candidate + 1))
+    done
+    return 1
 }
 
 prompt_value() {
@@ -159,138 +451,574 @@ prompt_value() {
     local label="$2"
     local current_value="${!var_name}"
     local entered=""
-
     if [[ -n "$current_value" ]]; then
-        read -r -p "$label [$current_value]: " entered
-
+        read -r -p "$label [$current_value]: " entered || return "$EXIT_OPERATIONAL"
         if [[ -n "$entered" ]]; then
             printf -v "$var_name" '%s' "$entered"
         fi
     else
-        read -r -p "$label: " entered
-
+        read -r -p "$label: " entered || return "$EXIT_OPERATIONAL"
         if [[ -n "$entered" ]]; then
             printf -v "$var_name" '%s' "$entered"
         fi
     fi
 }
 
-configure_profile() {
+is_loopback_host() {
+    case "$1" in
+        localhost|127.*|::1) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+is_wildcard_host() {
+    case "$1" in
+        0.0.0.0|::|'*') return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+warn_listener_exposure() {
+    local interactive="${1:-no}"
+    if is_wildcard_host "$LISTEN_HOST"; then
+        printf 'WARNING: This exposes an unauthenticated SOCKS listener on all matching interfaces.\n' >&2
+        if [[ "$interactive" == "yes" ]]; then
+            local answer=""
+            read -r -p "Continue with wildcard listener? [y/N]: " answer || return "$EXIT_OPERATIONAL"
+            case "$answer" in
+                y|Y|yes|YES) ;;
+                *) printf 'Cancelled.\n' >&2; return "$EXIT_OPERATIONAL" ;;
+            esac
+        fi
+    elif ! is_loopback_host "$LISTEN_HOST"; then
+        printf 'WARNING: SOCKS listener is reachable outside loopback depending on routing/firewall.\n' >&2
+    fi
+}
+
+configure_new_profile() {
     local name="$1"
     local inherit="${2:-yes}"
+    local inherited_user="$DEFAULT_USER"
+    local inherited_ssh_port="$DEFAULT_SSH_PORT"
+    local inherited_key=""
+    local inherited_listen_host="$DEFAULT_LISTEN_HOST"
+    local current
 
-    reset_config
-
-    # 新配置默认继承上一次使用的参数
     if [[ "$inherit" == "yes" ]]; then
-        local current
-
         current="$(get_current_profile 2>/dev/null || true)"
-
-        if [[ -n "$current" ]] && profile_exists "$current"; then
-            load_profile "$current"
+        if [[ -n "$current" ]] && load_profile "$current" >/dev/null 2>&1; then
+            inherited_user="$USER_NAME"
+            inherited_ssh_port="$SSH_PORT"
+            inherited_key="$KEY"
+            inherited_listen_host="$LISTEN_HOST"
         fi
     fi
 
-    echo
-    echo "配置 SOCKS5 SSH 隧道: $name"
-    echo "直接回车保留 [] 中的默认值。"
-    echo
+    reset_config
+    USER_NAME="$inherited_user"
+    SSH_PORT="$inherited_ssh_port"
+    KEY="$inherited_key"
+    LISTEN_HOST="$inherited_listen_host"
+    LISTEN_PORT="$(suggest_listen_port)" || {
+        printf 'no available suggested LISTEN_PORT in 18080..65535\n' >&2
+        return "$EXIT_USAGE"
+    }
 
-    prompt_value HOST "SSH Host"
-    prompt_value USER_NAME "SSH User"
-    prompt_value SSH_PORT "SSH Port"
-    prompt_value KEY "Private Key（留空则使用 ssh-agent/默认密钥）"
-    prompt_value BIND "Bind Address"
-    prompt_value PORT "SOCKS Port"
+    printf '\nConfigure SOCKS5 SSH tunnel: %s\n\n' "$name"
+    prompt_value HOST "SSH Host" || return $?
+    prompt_value USER_NAME "SSH User" || return $?
+    prompt_value SSH_PORT "SSH Port" || return $?
+    prompt_value KEY "Private Key (empty = ssh-agent/default identity)" || return $?
+    prompt_value LISTEN_HOST "Listen Host" || return $?
+    prompt_value LISTEN_PORT "Listen Port" || return $?
 
-    [[ -n "$HOST" ]] || die "SSH Host 不能为空"
-    [[ -n "$USER_NAME" ]] || die "SSH User 不能为空"
-    [[ "$SSH_PORT" =~ ^[0-9]+$ ]] || die "SSH Port 必须是数字"
-    [[ "$PORT" =~ ^[0-9]+$ ]] || die "SOCKS Port 必须是数字"
+    CLIENT_HOST="$(default_client_host "$LISTEN_HOST")"
+    CLIENT_PORT="$LISTEN_PORT"
+    AUTO_ACTIVATE="$DEFAULT_AUTO_ACTIVATE"
 
-    if [[ -n "$KEY" ]]; then
-        KEY="$(expand_path "$KEY")"
+    prompt_value CLIENT_HOST "Client Host" || return $?
+    prompt_value CLIENT_PORT "Client Port" || return $?
+    prompt_value AUTO_ACTIVATE "Auto Activate" || return $?
 
-        [[ -f "$KEY" ]] || die "找不到私钥: $KEY"
-    fi
-
-    save_profile "$name"
+    validate_profile_values yes || return $?
+    warn_listener_exposure yes || return $?
+    save_profile "$name" || return $?
     set_current_profile "$name"
-
-    echo
-    echo "已保存配置: $name"
+    printf 'Saved profile: %s\n' "$name"
 }
 
-profile_pid() {
+edit_profile() {
+    local name="$1"
+    load_profile "$name" || return $?
+
+    printf '\nEdit profile: %s\n\n' "$name"
+    prompt_value HOST "SSH Host" || return $?
+    prompt_value USER_NAME "SSH User" || return $?
+    prompt_value SSH_PORT "SSH Port" || return $?
+    prompt_value KEY "Private Key" || return $?
+    prompt_value LISTEN_HOST "Listen Host" || return $?
+    prompt_value LISTEN_PORT "Listen Port" || return $?
+    prompt_value CLIENT_HOST "Client Host" || return $?
+    prompt_value CLIENT_PORT "Client Port" || return $?
+    prompt_value AUTO_ACTIVATE "Auto Activate" || return $?
+
+    validate_profile_values yes || return $?
+    warn_listener_exposure yes || return $?
+    save_profile "$name" || return $?
+    set_current_profile "$name"
+    printf 'Profile saved: %s\n' "$name"
+}
+
+reset_runtime() {
+    R_PID=""
+    R_PROCESS_START_ID=""
+    R_STARTED_AT=""
+    R_PHASE=""
+    R_HOST=""
+    R_USER_NAME=""
+    R_SSH_PORT=""
+    R_KEY=""
+    R_LISTEN_HOST=""
+    R_LISTEN_PORT=""
+    R_CLIENT_HOST=""
+    R_CLIENT_PORT=""
+    R_AUTO_ACTIVATE=""
+}
+
+load_runtime_state() {
     local name="$1"
     local file
-
-    file="$(pid_file "$name")"
-
+    file="$(state_file "$name")"
     [[ -f "$file" ]] || return 1
+    file_contains_nul "$file" && return "$EXIT_STATE"
 
-    cat "$file"
+    reset_runtime
+    local line key value
+    local -A seen=()
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ -n "$line" && "$line" == *=* && "$line" != *$'\r'* ]] || return "$EXIT_STATE"
+        key="${line%%=*}"
+        value="${line#*=}"
+        case "$key" in
+            PID|PROCESS_START_ID|STARTED_AT|PHASE|HOST|USER_NAME|SSH_PORT|KEY|LISTEN_HOST|LISTEN_PORT|CLIENT_HOST|CLIENT_PORT|AUTO_ACTIVATE) ;;
+            *) return "$EXIT_STATE" ;;
+        esac
+        [[ -z "${seen[$key]+x}" ]] || return "$EXIT_STATE"
+        seen["$key"]=1
+        printf -v "R_$key" '%s' "$value"
+    done <"$file"
+
+    local required
+    for required in PID PROCESS_START_ID STARTED_AT PHASE HOST USER_NAME SSH_PORT KEY LISTEN_HOST LISTEN_PORT CLIENT_HOST CLIENT_PORT AUTO_ACTIVATE; do
+        [[ -n "${seen[$required]+x}" ]] || return "$EXIT_STATE"
+    done
+    [[ "$R_PID" =~ ^[0-9]+$ && "$R_PROCESS_START_ID" =~ ^[0-9]+$ ]] || return "$EXIT_STATE"
+    case "$R_PHASE" in STARTING|READY) ;; *) return "$EXIT_STATE" ;; esac
 }
 
-is_running() {
+write_runtime_values() {
     local name="$1"
-    local pid
-
-    pid="$(profile_pid "$name" 2>/dev/null || true)"
-
-    [[ -n "$pid" ]] || return 1
-    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
-
-    if ! kill -0 "$pid" 2>/dev/null; then
-        rm -f "$(pid_file "$name")"
-        return 1
-    fi
-
-    local comm
-    comm="$(ps -p "$pid" -o comm= 2>/dev/null | xargs || true)"
-
-    if [[ "$comm" != "autossh" ]]; then
-        rm -f "$(pid_file "$name")"
-        return 1
-    fi
-
-    return 0
+    local pid="$2"
+    local start_id="$3"
+    local started_at="$4"
+    local phase="$5"
+    local rhost="$6"
+    local ruser="$7"
+    local rsshport="$8"
+    local rkey="$9"
+    shift 9
+    local rlistenhost="$1" rlistenport="$2" rclienthost="$3" rclientport="$4" rauto="$5"
+    local content
+    printf -v content '%s\n' \
+        "PID=$pid" \
+        "PROCESS_START_ID=$start_id" \
+        "STARTED_AT=$started_at" \
+        "PHASE=$phase" \
+        "HOST=$rhost" \
+        "USER_NAME=$ruser" \
+        "SSH_PORT=$rsshport" \
+        "KEY=$rkey" \
+        "LISTEN_HOST=$rlistenhost" \
+        "LISTEN_PORT=$rlistenport" \
+        "CLIENT_HOST=$rclienthost" \
+        "CLIENT_PORT=$rclientport" \
+        "AUTO_ACTIVATE=$rauto"
+    atomic_write_file "$(state_file "$name")" 600 "$content"
 }
 
-start_profile() {
-    local name="$1"
+write_runtime_from_config() {
+    local name="$1" pid="$2" start_id="$3" phase="$4"
+    local started_at
+    started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    write_runtime_values "$name" "$pid" "$start_id" "$started_at" "$phase" \
+        "$HOST" "$USER_NAME" "$SSH_PORT" "$KEY" "$LISTEN_HOST" "$LISTEN_PORT" \
+        "$CLIENT_HOST" "$CLIENT_PORT" "$AUTO_ACTIVATE"
+}
 
-    check_start_dependencies
+write_runtime_from_loaded() {
+    local name="$1" phase="$2"
+    write_runtime_values "$name" "$R_PID" "$R_PROCESS_START_ID" "$R_STARTED_AT" "$phase" \
+        "$R_HOST" "$R_USER_NAME" "$R_SSH_PORT" "$R_KEY" "$R_LISTEN_HOST" "$R_LISTEN_PORT" \
+        "$R_CLIENT_HOST" "$R_CLIENT_PORT" "$R_AUTO_ACTIVATE"
+}
 
-    profile_exists "$name" || die "配置不存在: $name"
+remove_runtime_state() {
+    rm -f "$(state_file "$1")"
+}
 
-    load_profile "$name" || die "无法读取配置: $name"
+read_process_start_id() {
+    local pid="$1"
+    local stat rest
+    [[ -r "$PROC_ROOT/$pid/stat" ]] || return 1
+    IFS= read -r stat <"$PROC_ROOT/$pid/stat" || return 1
+    [[ "$stat" == *") "* ]] || return 1
+    rest="${stat##*) }"
+    awk '{print $20}' <<<"$rest"
+}
 
-    if is_running "$name"; then
-        set_current_profile "$name"
+pid_exists() {
+    [[ -d "$PROC_ROOT/$1" ]]
+}
 
-        echo "配置 '$name' 已经运行。"
-        echo
-        echo "PID:    $(profile_pid "$name")"
-        echo "SOCKS5: socks5h://$BIND:$PORT"
-        echo "SSH:    $USER_NAME@$HOST:$SSH_PORT"
+identity_read_failure_state() {
+    local pid="$1"
+    if pid_exists "$pid"; then
+        printf 'UNKNOWN\n'
+    else
+        printf 'MISSING\n'
+    fi
+}
+
+process_identity() {
+    local name="$1" pid="$2" expected_start="$3"
+    if ! pid_exists "$pid"; then
+        printf 'MISSING\n'
         return 0
     fi
 
-    if [[ -n "$KEY" && ! -f "$KEY" ]]; then
-        die "找不到私钥: $KEY"
+    local actual_start
+    actual_start="$(read_process_start_id "$pid" 2>/dev/null || true)"
+    if [[ -z "$actual_start" ]]; then
+        identity_read_failure_state "$pid"
+        return 0
+    fi
+    [[ "$actual_start" == "$expected_start" ]] || { printf 'MISMATCH\n'; return 0; }
+
+    local comm
+    if [[ ! -r "$PROC_ROOT/$pid/comm" ]]; then
+        identity_read_failure_state "$pid"
+        return 0
+    fi
+    if ! IFS= read -r comm <"$PROC_ROOT/$pid/comm"; then
+        identity_read_failure_state "$pid"
+        return 0
+    fi
+    [[ "$comm" == "autossh" ]] || { printf 'MISMATCH\n'; return 0; }
+
+    local exe
+    exe="$(readlink "$PROC_ROOT/$pid/exe" 2>/dev/null || true)"
+    if [[ -z "$exe" ]]; then
+        identity_read_failure_state "$pid"
+        return 0
+    fi
+    [[ "$(basename "$exe")" == "autossh" ]] || { printf 'MISMATCH\n'; return 0; }
+
+    if [[ ! -r "$PROC_ROOT/$pid/environ" ]]; then
+        identity_read_failure_state "$pid"
+        return 0
+    fi
+    grep -zFqx "SOCKSCTL_PROFILE=$name" "$PROC_ROOT/$pid/environ" 2>/dev/null
+    local grep_rc=$?
+    case "$grep_rc" in
+        0) ;;
+        1)
+            if pid_exists "$pid"; then
+                printf 'MISMATCH\n'
+            else
+                printf 'MISSING\n'
+            fi
+            return 0
+            ;;
+        *)
+            identity_read_failure_state "$pid"
+            return 0
+            ;;
+    esac
+
+    printf 'MATCH\n'
+}
+
+find_ssh_child() {
+    local supervisor_pid="$1"
+    local children
+    children="$(pgrep -P "$supervisor_pid" -x ssh 2>/dev/null || true)"
+    local count=0 child=""
+    while IFS= read -r child; do
+        [[ -n "$child" ]] || continue
+        count=$((count + 1))
+        SSH_CHILD_PID="$child"
+    done <<<"$children"
+    ((count == 1))
+}
+
+endpoint_matches_host_port() {
+    local endpoint="$1" host="$2" port="$3"
+    local addr eport
+    if [[ "$endpoint" == \[*\]:* ]]; then
+        addr="${endpoint#\[}"
+        addr="${addr%%\]*}"
+        eport="${endpoint##*:}"
+    else
+        eport="${endpoint##*:}"
+        addr="${endpoint%:*}"
+    fi
+    [[ "$eport" == "$port" ]] || return 1
+
+    case "$host" in
+        '*')
+            [[ "$addr" == "*" || "$addr" == "0.0.0.0" || "$addr" == "::" ]]
+            return
+            ;;
+        0.0.0.0)
+            [[ "$addr" == "0.0.0.0" || "$addr" == "*" ]]
+            return
+            ;;
+        ::)
+            [[ "$addr" == "::" || "$addr" == "*" ]]
+            return
+            ;;
+    esac
+
+    [[ "$addr" == "$host" ]] && return 0
+
+    if command_exists getent; then
+        local resolved
+        while IFS= read -r resolved; do
+            [[ -n "$resolved" && "$addr" == "$resolved" ]] && return 0
+        done < <(getent ahosts "$host" 2>/dev/null | awk '{print $1}' | awk '!seen[$0]++')
+    fi
+    return 1
+}
+
+listener_owned_by_child() {
+    local host="$1" port="$2" child_pid="$3"
+    local line state local_ep
+    while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        read -r state _ _ local_ep _ _ <<<"$line"
+        [[ "$state" == "LISTEN" ]] || continue
+        endpoint_matches_host_port "$local_ep" "$host" "$port" || continue
+        [[ "$line" == *"pid=$child_pid,"* ]] || continue
+        return 0
+    done < <(ss -H -ltnp 2>/dev/null || true)
+    return 1
+}
+
+probe_endpoint() {
+    nc -z -w 1 "$1" "$2" >/dev/null 2>&1
+}
+
+runtime_readiness_ready() {
+    find_ssh_child "$R_PID" || return 1
+    listener_owned_by_child "$R_LISTEN_HOST" "$R_LISTEN_PORT" "$SSH_CHILD_PID" || return 1
+    local probe_host
+    probe_host="$(probe_host_for_listener "$R_LISTEN_HOST")"
+    probe_endpoint "$probe_host" "$R_LISTEN_PORT"
+}
+
+tunnel_state_for() {
+    local name="$1"
+    TUNNEL_STATE="STOPPED"
+    IDENTITY_STATE="MISSING"
+
+    if [[ ! -f "$(state_file "$name")" ]]; then
+        return 0
+    fi
+    if ! load_runtime_state "$name"; then
+        TUNNEL_STATE="UNKNOWN"
+        IDENTITY_STATE="UNKNOWN"
+        return "$EXIT_STATE"
     fi
 
+    IDENTITY_STATE="$(process_identity "$name" "$R_PID" "$R_PROCESS_START_ID")"
+    case "$IDENTITY_STATE" in
+        MISSING|MISMATCH)
+            TUNNEL_STATE="STOPPED"
+            ;;
+        UNKNOWN)
+            TUNNEL_STATE="UNKNOWN"
+            return "$EXIT_STATE"
+            ;;
+        MATCH)
+            if runtime_readiness_ready; then
+                TUNNEL_STATE="READY"
+            elif [[ "$R_PHASE" == "STARTING" ]]; then
+                TUNNEL_STATE="STARTING"
+            else
+                TUNNEL_STATE="DEGRADED"
+            fi
+            ;;
+    esac
+    return 0
+}
+
+with_profile_lock() {
+    local name="$1"
+    shift
+    local lock
+    lock="$(lock_file "$name")"
+    : >"$lock" 2>/dev/null || {
+        printf 'cannot open lock file: %s\n' "$lock" >&2
+        return "$EXIT_STATE"
+    }
+    chmod 600 "$lock" 2>/dev/null || true
+
+    local lock_fd
+    exec {lock_fd}>"$lock" || return "$EXIT_STATE"
+    if ! flock -w "$LOCK_TIMEOUT" "$lock_fd"; then
+        printf 'state lock timeout for profile %s\n' "$name" >&2
+        exec {lock_fd}>&-
+        return "$EXIT_STATE"
+    fi
+
+    "$@"
+    local rc=$?
+    flock -u "$lock_fd" >/dev/null 2>&1 || true
+    exec {lock_fd}>&-
+    return "$rc"
+}
+
+tail_start_log() {
+    local name="$1"
     local log
-    local pidfile
-
     log="$(log_file "$name")"
-    pidfile="$(pid_file "$name")"
+    printf '%s\n' '---- last autossh log lines ----' >&2
+    tail -n 30 "$log" 2>/dev/null >&2 || true
+    printf '%s\n' '--------------------------------' >&2
+}
 
-    local -a cmd
+cleanup_stale_state_if_safe() {
+    local name="$1"
+    load_runtime_state "$name" || return "$EXIT_STATE"
+    local identity
+    identity="$(process_identity "$name" "$R_PID" "$R_PROCESS_START_ID")"
+    case "$identity" in
+        MISSING|MISMATCH) remove_runtime_state "$name"; return 0 ;;
+        UNKNOWN) return "$EXIT_STATE" ;;
+        MATCH) return 1 ;;
+    esac
+}
 
-    cmd=(
+set_runtime_phase() {
+    local name="$1" phase="$2"
+    load_runtime_state "$name" || return "$EXIT_STATE"
+    write_runtime_from_loaded "$name" "$phase" || return "$EXIT_OPERATIONAL"
+    R_PHASE="$phase"
+}
+
+terminate_matching_runtime() {
+    local name="$1"
+    load_runtime_state "$name" || return "$EXIT_STATE"
+    local pid="$R_PID"
+    local start_id="$R_PROCESS_START_ID"
+    local identity
+    identity="$(process_identity "$name" "$pid" "$start_id")"
+    case "$identity" in
+        MISSING|MISMATCH)
+            remove_runtime_state "$name"
+            return 0
+            ;;
+        UNKNOWN)
+            printf 'cannot verify process identity for %s; refusing to kill PID %s\n' "$name" "$pid" >&2
+            return "$EXIT_STATE"
+            ;;
+        MATCH) ;;
+    esac
+
+    kill -TERM "$pid" 2>/dev/null || true
+    local deadline=$((SECONDS + STOP_TIMEOUT))
+    while ((SECONDS <= deadline)); do
+        identity="$(process_identity "$name" "$pid" "$start_id")"
+        case "$identity" in
+            MISSING|MISMATCH)
+                remove_runtime_state "$name"
+                return 0
+                ;;
+            UNKNOWN)
+                printf 'process identity became UNKNOWN while stopping %s\n' "$name" >&2
+                return "$EXIT_STATE"
+                ;;
+        esac
+        sleep 0.1
+    done
+
+    identity="$(process_identity "$name" "$pid" "$start_id")"
+    if [[ "$identity" == "MATCH" ]]; then
+        kill -KILL "$pid" 2>/dev/null || true
+    elif [[ "$identity" == "UNKNOWN" ]]; then
+        return "$EXIT_STATE"
+    else
+        remove_runtime_state "$name"
+        return 0
+    fi
+
+    deadline=$((SECONDS + 2))
+    while ((SECONDS <= deadline)); do
+        identity="$(process_identity "$name" "$pid" "$start_id")"
+        case "$identity" in
+            MISSING|MISMATCH)
+                remove_runtime_state "$name"
+                return 0
+                ;;
+            UNKNOWN) return "$EXIT_STATE" ;;
+        esac
+        sleep 0.1
+    done
+
+    printf 'failed to confirm PID %s exited for %s\n' "$pid" "$name" >&2
+    return "$EXIT_STATE"
+}
+
+wait_existing_supervisor() {
+    local name="$1"
+    local deadline=$((SECONDS + START_TIMEOUT))
+    while ((SECONDS <= deadline)); do
+        if ! load_runtime_state "$name"; then
+            return 10
+        fi
+        local identity
+        identity="$(process_identity "$name" "$R_PID" "$R_PROCESS_START_ID")"
+        case "$identity" in
+            UNKNOWN) return "$EXIT_STATE" ;;
+            MISSING|MISMATCH)
+                remove_runtime_state "$name"
+                return 10
+                ;;
+            MATCH)
+                if runtime_readiness_ready; then
+                    set_runtime_phase "$name" READY || return $?
+                    set_current_profile "$name"
+                    return 0
+                fi
+                ;;
+        esac
+        sleep "$POLL_INTERVAL"
+    done
+    printf 'existing autossh supervisor for %s did not recover before timeout\n' "$name" >&2
+    return "$EXIT_OPERATIONAL"
+}
+
+spawn_and_wait_ready() {
+    local name="$1"
+    local log
+    log="$(log_file "$name")"
+    : >"$log" || return "$EXIT_OPERATIONAL"
+    chmod 600 "$log" 2>/dev/null || true
+
+    local bind_spec
+    bind_spec="$(format_bind_spec "$LISTEN_HOST" "$LISTEN_PORT")"
+
+    local -a cmd=(
         autossh
         -M 0
         -N
@@ -302,614 +1030,973 @@ start_profile() {
         -o "ConnectTimeout=$CONNECT_TIMEOUT"
         -o "TCPKeepAlive=yes"
         -o "StrictHostKeyChecking=accept-new"
+        -o "BatchMode=yes"
     )
-
     if [[ -n "$KEY" ]]; then
-        cmd+=(
-            -i "$KEY"
-            -o "IdentitiesOnly=yes"
-        )
+        cmd+=(-i "$KEY" -o "IdentitiesOnly=yes")
     fi
+    cmd+=(-D "$bind_spec" "$USER_NAME@$HOST")
 
-    cmd+=(
-        -D "$BIND:$PORT"
-        "$USER_NAME@$HOST"
-    )
-
-    echo "正在启动 '$name' ..."
-    echo "SSH:    $USER_NAME@$HOST:$SSH_PORT"
-    echo "SOCKS5: socks5h://$BIND:$PORT"
-
-    : > "$log"
-
-    AUTOSSH_GATETIME=0 \
-    nohup "${cmd[@]}" >> "$log" 2>&1 < /dev/null &
-
+    printf 'Starting %s\n' "$name"
+    SOCKSCTL_PROFILE="$name" AUTOSSH_GATETIME=0 \
+        nohup "${cmd[@]}" >>"$log" 2>&1 </dev/null &
     local pid=$!
 
-    printf '%s\n' "$pid" > "$pidfile"
-    chmod 600 "$pidfile"
-
-    sleep 2
-
-    if ! is_running "$name"; then
-        rm -f "$pidfile"
-
-        echo
-        echo "启动失败。"
-        echo
-        echo "最后日志:"
-        echo "--------------------------------------------------"
-        tail -n 30 "$log" 2>/dev/null || true
-        echo "--------------------------------------------------"
-
-        return 1
-    fi
-
-    set_current_profile "$name"
-
-    echo
-    echo "已启动"
-    echo "Profile: $name"
-    echo "PID:     $pid"
-    echo "SOCKS5:  socks5h://$BIND:$PORT"
-}
-
-stop_profile() {
-    local name="$1"
-
-    profile_exists "$name" || die "配置不存在: $name"
-
-    if ! is_running "$name"; then
-        rm -f "$(pid_file "$name")"
-        echo "'$name' 未运行。"
-        return 0
-    fi
-
-    local pid
-    local children
-
-    pid="$(profile_pid "$name")"
-
-    echo "正在停止 '$name' (PID $pid)..."
-
-    children="$(pgrep -P "$pid" 2>/dev/null || true)"
-
-    kill "$pid" 2>/dev/null || true
-
-    if [[ -n "$children" ]]; then
-        kill $children 2>/dev/null || true
-    fi
-
-    local i
-
-    for i in {1..30}; do
-        if ! kill -0 "$pid" 2>/dev/null; then
-            break
-        fi
-
-        sleep 0.1
+    local start_id=""
+    local attempts=20
+    while (( attempts > 0 )); do
+        start_id="$(read_process_start_id "$pid" 2>/dev/null || true)"
+        [[ -n "$start_id" ]] && break
+        sleep 0.05
+        ((attempts -= 1))
     done
 
-    if kill -0 "$pid" 2>/dev/null; then
-        kill -9 "$pid" 2>/dev/null || true
+    if [[ -z "$start_id" ]]; then
+        printf 'cannot establish process start identity for new autossh PID %s\n' "$pid" >&2
+        tail_start_log "$name"
+        return "$EXIT_STATE"
     fi
 
-    rm -f "$(pid_file "$name")"
+    write_runtime_from_config "$name" "$pid" "$start_id" STARTING || return "$EXIT_OPERATIONAL"
 
-    echo "已停止 '$name'。"
-}
-
-cmd_start() {
-    local name="${1:-}"
-
-    if [[ -z "$name" ]]; then
-        name="$(get_current_profile 2>/dev/null || true)"
-    fi
-
-    if [[ -z "$name" ]]; then
-        local suggested="default"
-        local entered=""
-
-        echo "未找到已有配置。"
-        read -r -p "配置名称 [$suggested]: " entered
-
-        name="${entered:-$suggested}"
-
-        valid_profile_name "$name" ||
-            die "配置名称只能包含字母、数字、点、下划线和横线"
-
-        configure_profile "$name" "no"
-    fi
-
-    if ! profile_exists "$name"; then
-        valid_profile_name "$name" ||
-            die "无效配置名称: $name"
-
-        echo "配置 '$name' 不存在，将创建新配置。"
-        configure_profile "$name" "yes"
-    fi
-
-    start_profile "$name"
-}
-
-cmd_add() {
-    local name="${1:-}"
-
-    if [[ -z "$name" ]]; then
-        read -r -p "新配置名称: " name
-    fi
-
-    [[ -n "$name" ]] || die "必须指定配置名称"
-
-    valid_profile_name "$name" ||
-        die "配置名称只能包含字母、数字、点、下划线和横线"
-
-    if profile_exists "$name"; then
-        die "配置已经存在: $name"
-    fi
-
-    configure_profile "$name" "yes"
-
-    echo
-    echo "启动该配置:"
-    echo "  socksctl start $name"
-}
-
-cmd_edit() {
-    local name="${1:-}"
-
-    if [[ -z "$name" ]]; then
-        name="$(get_current_profile 2>/dev/null || true)"
-    fi
-
-    [[ -n "$name" ]] || die "没有当前配置"
-    profile_exists "$name" || die "配置不存在: $name"
-
-    local was_running="no"
-
-    if is_running "$name"; then
-        was_running="yes"
-    fi
-
-    load_profile "$name"
-
-    echo
-    echo "编辑配置: $name"
-    echo "直接回车保留原值。"
-    echo
-
-    prompt_value HOST "SSH Host"
-    prompt_value USER_NAME "SSH User"
-    prompt_value SSH_PORT "SSH Port"
-    prompt_value KEY "Private Key"
-    prompt_value BIND "Bind Address"
-    prompt_value PORT "SOCKS Port"
-
-    [[ -n "$HOST" ]] || die "SSH Host 不能为空"
-    [[ "$SSH_PORT" =~ ^[0-9]+$ ]] || die "SSH Port 必须是数字"
-    [[ "$PORT" =~ ^[0-9]+$ ]] || die "SOCKS Port 必须是数字"
-
-    if [[ -n "$KEY" ]]; then
-        KEY="$(expand_path "$KEY")"
-        [[ -f "$KEY" ]] || die "找不到私钥: $KEY"
-    fi
-
-    save_profile "$name"
-    set_current_profile "$name"
-
-    echo
-    echo "配置已保存。"
-
-    if [[ "$was_running" == "yes" ]]; then
-        echo
-        echo "注意：'$name' 当前正在运行。"
-        echo "执行以下命令使新配置生效:"
-        echo
-        echo "  socksctl restart $name"
-    fi
-}
-
-cmd_remove() {
-    local name="${1:-}"
-
-    [[ -n "$name" ]] || die "用法: socksctl remove <name>"
-    profile_exists "$name" || die "配置不存在: $name"
-
-    if is_running "$name"; then
-        read -r -p "'$name' 正在运行，是否停止并删除？[y/N]: " answer
-
-        case "$answer" in
-            y|Y|yes|YES)
-                stop_profile "$name"
+    local deadline=$((SECONDS + START_TIMEOUT))
+    while ((SECONDS <= deadline)); do
+        load_runtime_state "$name" || return "$EXIT_STATE"
+        local identity
+        identity="$(process_identity "$name" "$R_PID" "$R_PROCESS_START_ID")"
+        case "$identity" in
+            UNKNOWN)
+                printf 'new autossh identity is UNKNOWN; preserving runtime state\n' >&2
+                return "$EXIT_STATE"
                 ;;
-            *)
-                echo "已取消。"
-                return 0
+            MISSING|MISMATCH)
+                remove_runtime_state "$name"
+                printf 'autossh exited or identity changed before readiness\n' >&2
+                tail_start_log "$name"
+                return "$EXIT_OPERATIONAL"
+                ;;
+            MATCH)
+                if runtime_readiness_ready; then
+                    set_runtime_phase "$name" READY || return $?
+                    set_current_profile "$name"
+                    printf 'Tunnel READY: %s (%s)\n' "$name" "$(format_socks_uri "$CLIENT_HOST" "$CLIENT_PORT")"
+                    return 0
+                fi
+                ;;
+        esac
+        sleep "$POLL_INTERVAL"
+    done
+
+    printf 'start timeout waiting for listener ownership/readiness: %s\n' "$name" >&2
+    terminate_matching_runtime "$name"
+    local terminate_rc=$?
+    if ((terminate_rc != 0)); then
+        tail_start_log "$name"
+        return "$terminate_rc"
+    fi
+    tail_start_log "$name"
+    return "$EXIT_OPERATIONAL"
+}
+
+_start_locked() {
+    local name="$1"
+    load_profile "$name" || {
+        printf 'cannot read profile: %s\n' "$name" >&2
+        return "$EXIT_USAGE"
+    }
+    validate_profile_values yes || return $?
+
+    if [[ -f "$(state_file "$name")" ]]; then
+        if ! load_runtime_state "$name"; then
+            printf 'invalid runtime state for %s\n' "$name" >&2
+            return "$EXIT_STATE"
+        fi
+        local identity
+        identity="$(process_identity "$name" "$R_PID" "$R_PROCESS_START_ID")"
+        case "$identity" in
+            UNKNOWN)
+                printf 'runtime identity UNKNOWN for %s; refusing second autossh\n' "$name" >&2
+                return "$EXIT_STATE"
+                ;;
+            MISSING|MISMATCH)
+                remove_runtime_state "$name"
+                ;;
+            MATCH)
+                if runtime_readiness_ready; then
+                    set_runtime_phase "$name" READY || return $?
+                    set_current_profile "$name"
+                    printf 'Tunnel already READY: %s\n' "$name"
+                    return 0
+                fi
+                set_runtime_phase "$name" READY >/dev/null 2>&1 || true
+                wait_existing_supervisor "$name"
+                local wait_rc=$?
+                if ((wait_rc == 0)); then
+                    printf 'Tunnel READY: %s\n' "$name"
+                    return 0
+                elif ((wait_rc != 10)); then
+                    return "$wait_rc"
+                fi
                 ;;
         esac
     fi
 
-    rm -f "$(profile_file "$name")"
-    rm -f "$(pid_file "$name")"
-    rm -f "$(log_file "$name")"
+    spawn_and_wait_ready "$name"
+}
 
-    local current
-    current="$(get_current_profile 2>/dev/null || true)"
-
-    if [[ "$current" == "$name" ]]; then
-        rm -f "$CURRENT_FILE"
-
-        local next
-        next="$(first_profile 2>/dev/null || true)"
-
-        if [[ -n "$next" ]]; then
-            set_current_profile "$next"
-        fi
+_stop_locked() {
+    local name="$1"
+    if [[ ! -f "$(state_file "$name")" ]]; then
+        printf 'Already stopped: %s\n' "$name"
+        return 0
     fi
+    if ! load_runtime_state "$name"; then
+        printf 'invalid runtime state for %s; refusing destructive action\n' "$name" >&2
+        return "$EXIT_STATE"
+    fi
+    local identity
+    identity="$(process_identity "$name" "$R_PID" "$R_PROCESS_START_ID")"
+    case "$identity" in
+        MISSING|MISMATCH)
+            remove_runtime_state "$name"
+            printf 'Already stopped; stale runtime state cleaned: %s\n' "$name"
+            return 0
+            ;;
+        UNKNOWN)
+            printf 'runtime identity UNKNOWN for %s; refusing to kill PID %s\n' "$name" "$R_PID" >&2
+            return "$EXIT_STATE"
+            ;;
+        MATCH)
+            terminate_matching_runtime "$name" || return $?
+            printf 'Stopped: %s\n' "$name"
+            ;;
+    esac
+}
 
-    echo "已删除配置: $name"
+cmd_start() {
+    local name="${1:-}"
+    require_commands ssh autossh flock pgrep ps ss nc readlink grep awk od || return $?
+    if [[ -z "$name" ]]; then
+        name="$(get_current_profile 2>/dev/null || true)"
+    fi
+    if [[ -z "$name" ]]; then
+        local entered=""
+        read -r -p "Profile name [default]: " entered || return "$EXIT_OPERATIONAL"
+        name="${entered:-default}"
+        valid_profile_name "$name" || { printf 'invalid profile name\n' >&2; return "$EXIT_USAGE"; }
+        configure_new_profile "$name" no || return $?
+    elif ! profile_exists "$name"; then
+        valid_profile_name "$name" || { printf 'invalid profile name\n' >&2; return "$EXIT_USAGE"; }
+        printf 'Profile %s does not exist; creating it.\n' "$name"
+        configure_new_profile "$name" yes || return $?
+    fi
+    with_profile_lock "$name" _start_locked "$name"
 }
 
 cmd_stop() {
     local name="${1:-}"
-
-    if [[ -z "$name" ]]; then
-        name="$(get_current_profile 2>/dev/null || true)"
-    fi
-
-    [[ -n "$name" ]] || die "没有当前配置"
-
-    stop_profile "$name"
+    require_commands flock readlink grep awk od || return $?
+    [[ -n "$name" ]] || name="$(get_current_profile 2>/dev/null || true)"
+    [[ -n "$name" ]] || { printf 'no current profile\n' >&2; return "$EXIT_USAGE"; }
+    profile_exists "$name" || { printf 'profile does not exist: %s\n' "$name" >&2; return "$EXIT_USAGE"; }
+    with_profile_lock "$name" _stop_locked "$name"
 }
 
 cmd_restart() {
     local name="${1:-}"
+    require_commands ssh autossh flock pgrep ps ss nc readlink grep awk od || return $?
+    [[ -n "$name" ]] || name="$(get_current_profile 2>/dev/null || true)"
+    [[ -n "$name" ]] || { printf 'no current profile\n' >&2; return "$EXIT_USAGE"; }
+    profile_exists "$name" || { printf 'profile does not exist: %s\n' "$name" >&2; return "$EXIT_USAGE"; }
+    with_profile_lock "$name" _restart_locked "$name"
+}
 
+_restart_locked() {
+    local name="$1"
+    _stop_locked "$name" || return $?
+    _start_locked "$name"
+}
+
+cmd_add() {
+    local name="${1:-}"
     if [[ -z "$name" ]]; then
-        name="$(get_current_profile 2>/dev/null || true)"
+        read -r -p "New profile name: " name || return "$EXIT_OPERATIONAL"
+    fi
+    [[ -n "$name" ]] || { printf 'profile name is required\n' >&2; return "$EXIT_USAGE"; }
+    valid_profile_name "$name" || { printf 'invalid profile name\n' >&2; return "$EXIT_USAGE"; }
+    ! profile_exists "$name" || { printf 'profile already exists: %s\n' "$name" >&2; return "$EXIT_USAGE"; }
+    configure_new_profile "$name" yes
+}
+
+cmd_edit() {
+    local name="${1:-}"
+    [[ -n "$name" ]] || name="$(get_current_profile 2>/dev/null || true)"
+    [[ -n "$name" ]] || { printf 'no current profile\n' >&2; return "$EXIT_USAGE"; }
+    profile_exists "$name" || { printf 'profile does not exist: %s\n' "$name" >&2; return "$EXIT_USAGE"; }
+
+    local old_tunnel=""
+    load_profile "$name" || return $?
+    old_tunnel="$HOST|$USER_NAME|$SSH_PORT|$KEY|$LISTEN_HOST|$LISTEN_PORT"
+    edit_profile "$name" || return $?
+    local new_tunnel="$HOST|$USER_NAME|$SSH_PORT|$KEY|$LISTEN_HOST|$LISTEN_PORT"
+    if [[ -f "$(state_file "$name")" && "$old_tunnel" != "$new_tunnel" ]]; then
+        printf 'Tunnel configuration changed; restart required.\n'
+    fi
+}
+
+_remove_locked() {
+    local name="$1"
+    local raw_current was_current="no"
+    raw_current="$(get_raw_current 2>/dev/null || true)"
+    [[ "$raw_current" == "$name" ]] && was_current="yes"
+
+    if [[ -f "$(state_file "$name")" ]]; then
+        if load_runtime_state "$name"; then
+            local identity
+            identity="$(process_identity "$name" "$R_PID" "$R_PROCESS_START_ID")"
+            if [[ "$identity" == "MATCH" ]]; then
+                local answer=""
+                if [[ "${SOCKSCTL_ASSUME_YES:-0}" == "1" ]]; then
+                    answer="yes"
+                else
+                    read -r -p "'$name' is running. Stop and remove? [y/N]: " answer || return "$EXIT_OPERATIONAL"
+                fi
+                case "$answer" in
+                    y|Y|yes|YES) ;;
+                    *) printf 'Cancelled.\n'; return 0 ;;
+                esac
+            elif [[ "$identity" == "UNKNOWN" ]]; then
+                printf 'runtime identity UNKNOWN; refusing remove\n' >&2
+                return "$EXIT_STATE"
+            fi
+        else
+            printf 'invalid runtime state; refusing remove\n' >&2
+            return "$EXIT_STATE"
+        fi
+        _stop_locked "$name" || return $?
     fi
 
-    [[ -n "$name" ]] || die "没有当前配置"
-    profile_exists "$name" || die "配置不存在: $name"
+    rm -f "$(profile_file "$name")" "$(state_file "$name")" "$(log_file "$name")"
 
-    stop_profile "$name"
-    start_profile "$name"
+    if [[ "$was_current" == "yes" ]]; then
+        local next
+        next="$(first_profile 2>/dev/null || true)"
+        if [[ -n "$next" ]]; then
+            set_current_profile "$next"
+        else
+            atomic_remove_file "$CURRENT_FILE"
+        fi
+    fi
+    printf 'Removed profile: %s\n' "$name"
+}
+
+cmd_remove() {
+    local name="$1"
+    require_commands flock readlink grep awk od || return $?
+    profile_exists "$name" || { printf 'profile does not exist: %s\n' "$name" >&2; return "$EXIT_USAGE"; }
+    with_profile_lock "$name" _remove_locked "$name"
 }
 
 cmd_use() {
-    local name="${1:-}"
-
-    [[ -n "$name" ]] || die "用法: socksctl use <name>"
-    profile_exists "$name" || die "配置不存在: $name"
-
+    local name="$1"
+    profile_exists "$name" || { printf 'profile does not exist: %s\n' "$name" >&2; return "$EXIT_USAGE"; }
     set_current_profile "$name"
-
-    echo "当前默认配置已切换为: $name"
+    printf 'Current profile: %s\n' "$name"
 }
 
-print_status() {
-    local name="$1"
+tunnel_config_drift() {
+    [[ "$HOST" == "$R_HOST" &&
+       "$USER_NAME" == "$R_USER_NAME" &&
+       "$SSH_PORT" == "$R_SSH_PORT" &&
+       "$KEY" == "$R_KEY" &&
+       "$LISTEN_HOST" == "$R_LISTEN_HOST" &&
+       "$LISTEN_PORT" == "$R_LISTEN_PORT" ]]
+}
 
-    profile_exists "$name" || die "配置不存在: $name"
-
-    load_profile "$name"
-
-    echo "Profile: $name"
-
-    if is_running "$name"; then
-        echo "Status:  RUNNING"
-        echo "PID:     $(profile_pid "$name")"
-    else
-        echo "Status:  STOPPED"
-    fi
-
-    echo "SSH:     $USER_NAME@$HOST:$SSH_PORT"
-    echo "SOCKS5:  socks5h://$BIND:$PORT"
-
-    if [[ -n "$KEY" ]]; then
-        echo "Key:     $KEY"
-    else
-        echo "Key:     ssh-agent / default"
-    fi
+activation_config_drift() {
+    [[ "$CLIENT_HOST" == "$R_CLIENT_HOST" &&
+       "$CLIENT_PORT" == "$R_CLIENT_PORT" &&
+       "$AUTO_ACTIVATE" == "$R_AUTO_ACTIVATE" ]]
 }
 
 cmd_status() {
     local name="${1:-}"
+    require_commands pgrep ss nc readlink grep awk od || return $?
+    [[ -n "$name" ]] || name="$(get_current_profile 2>/dev/null || true)"
+    [[ -n "$name" ]] || { printf 'no current profile\n' >&2; return "$EXIT_USAGE"; }
+    profile_exists "$name" || { printf 'profile does not exist: %s\n' "$name" >&2; return "$EXIT_USAGE"; }
 
-    if [[ -z "$name" ]]; then
-        name="$(get_current_profile 2>/dev/null || true)"
+    load_profile "$name" || return $?
+    tunnel_state_for "$name" >/dev/null 2>&1 || true
+
+    printf 'Profile:            %s\n' "$name"
+    printf 'Tunnel:             %s\n' "$TUNNEL_STATE"
+    printf 'Identity:           %s\n' "$IDENTITY_STATE"
+    if [[ -f "$(state_file "$name")" ]] && load_runtime_state "$name" 2>/dev/null; then
+        printf 'PID:                %s\n' "$R_PID"
+        printf '\nRuntime SSH:        %s@%s:%s\n' "$R_USER_NAME" "$R_HOST" "$R_SSH_PORT"
+        printf 'Runtime Listen:     %s\n' "$(format_endpoint "$R_LISTEN_HOST" "$R_LISTEN_PORT")"
+        printf '\nConfigured SSH:     %s@%s:%s\n' "$USER_NAME" "$HOST" "$SSH_PORT"
+        printf 'Configured Listen:  %s\n' "$(format_endpoint "$LISTEN_HOST" "$LISTEN_PORT")"
+        if tunnel_config_drift; then
+            printf '\nTunnel Config:      CURRENT\n'
+            printf 'Restart Required:   no\n'
+        else
+            printf '\nTunnel Config:      CHANGED\n'
+            printf 'Restart Required:   yes\n'
+        fi
+        if activation_config_drift; then
+            printf 'Activation Config:  CURRENT\n'
+        else
+            printf 'Activation Config:  CHANGED\n'
+        fi
+    else
+        printf '\nConfigured SSH:     %s@%s:%s\n' "$USER_NAME" "$HOST" "$SSH_PORT"
+        printf 'Configured Listen:  %s\n' "$(format_endpoint "$LISTEN_HOST" "$LISTEN_PORT")"
+        printf '\nTunnel Config:      CURRENT\n'
+        printf 'Restart Required:   no\n'
+        printf 'Activation Config:  CURRENT\n'
     fi
+    printf '\nClient Proxy:       %s\n' "$(format_socks_uri "$CLIENT_HOST" "$CLIENT_PORT")"
+    printf 'Auto Activate:      %s\n' "$AUTO_ACTIVATE"
 
-    [[ -n "$name" ]] || die "没有当前配置"
-
-    print_status "$name"
+    local caller_active="${SOCKSCTL_CALLER_ACTIVE_PROFILE:-}"
+    if [[ "$caller_active" == "$name" ]]; then
+        printf 'Shell:              ACTIVE\n'
+        if [[ "$TUNNEL_STATE" != "READY" ]]; then
+            printf 'WARNING: active shell points to a non-READY tunnel\n'
+        fi
+    else
+        printf 'Shell:              -\n'
+    fi
 }
 
 cmd_list() {
-    local current
+    require_commands pgrep ss nc readlink grep awk od || return $?
+    local current caller_active file found="no"
     current="$(get_current_profile 2>/dev/null || true)"
+    caller_active="${SOCKSCTL_CALLER_ACTIVE_PROFILE:-}"
 
-    printf "%-3s %-16s %-10s %-24s %-28s\n" \
-        "" "NAME" "STATUS" "SOCKS" "SSH"
-
-    printf "%-3s %-16s %-10s %-24s %-28s\n" \
-        "---" "----------------" "----------" "------------------------" "----------------------------"
-
-    local found="no"
-    local file
-
+    printf '%-16s %-10s %-8s %-8s %-24s %-24s %-6s\n' NAME TUNNEL DEFAULT SHELL LISTEN CLIENT AUTO
+    local LC_ALL=C
     for file in "$PROFILE_DIR"/*.conf; do
         [[ -e "$file" ]] || continue
-
         found="yes"
-
-        local name
-        local marker=""
-
+        local name default_marker="no" shell_marker="-"
         name="$(basename "$file" .conf)"
-
-        load_profile "$name"
-
-        local status="stopped"
-
-        if is_running "$name"; then
-            status="running"
+        load_profile "$name" || {
+            printf '%-16s %-10s\n' "$name" INVALID
+            continue
+        }
+        tunnel_state_for "$name" >/dev/null 2>&1 || true
+        [[ "$name" == "$current" ]] && default_marker="yes"
+        [[ "$name" == "$caller_active" ]] && shell_marker="active"
+        printf '%-16s %-10s %-8s %-8s %-24s %-24s %-6s\n' \
+            "$name" "$TUNNEL_STATE" "$default_marker" "$shell_marker" \
+            "$(format_endpoint "$LISTEN_HOST" "$LISTEN_PORT")" \
+            "$(format_endpoint "$CLIENT_HOST" "$CLIENT_PORT")" \
+            "$AUTO_ACTIVATE"
+        if [[ "$name" == "$caller_active" && "$TUNNEL_STATE" != "READY" ]]; then
+            printf 'WARNING: active shell points to a non-READY tunnel: %s\n' "$name" >&2
         fi
-
-        if [[ "$name" == "$current" ]]; then
-            marker="*"
-        fi
-
-        printf "%-3s %-16s %-10s %-24s %-28s\n" \
-            "$marker" \
-            "$name" \
-            "$status" \
-            "$BIND:$PORT" \
-            "$USER_NAME@$HOST:$SSH_PORT"
     done
-
-    if [[ "$found" == "no" ]]; then
-        echo "没有配置。"
-        return
-    fi
-
-    echo
-
-    if [[ -n "$current" ]]; then
-        echo "* 当前默认配置: $current"
-    fi
-}
-
-cmd_test() {
-    local name="${1:-}"
-
-    check_test_dependencies
-
-    if [[ -z "$name" ]]; then
-        name="$(get_current_profile 2>/dev/null || true)"
-    fi
-
-    [[ -n "$name" ]] || die "没有当前配置"
-    profile_exists "$name" || die "配置不存在: $name"
-
-    load_profile "$name"
-
-    if ! is_running "$name"; then
-        die "'$name' 当前没有运行"
-    fi
-
-    echo "测试配置: $name"
-    echo "SOCKS5: socks5h://$BIND:$PORT"
-    echo
-
-    local result=""
-
-    result="$(
-        curl \
-            -fsS \
-            --connect-timeout 8 \
-            --max-time 20 \
-            --proxy "socks5h://$BIND:$PORT" \
-            https://api.ipify.org \
-            2>/dev/null || true
-    )"
-
-    if [[ -z "$result" ]]; then
-        result="$(
-            curl \
-                -fsS \
-                --connect-timeout 8 \
-                --max-time 20 \
-                --proxy "socks5h://$BIND:$PORT" \
-                https://ifconfig.me/ip \
-                2>/dev/null || true
-        )"
-    fi
-
-    if [[ -z "$result" ]]; then
-        echo "测试失败。"
-        echo
-        echo "查看日志:"
-        echo "  socksctl logs $name"
-        return 1
-    fi
-
-    echo "连接正常"
-    echo "出口 IP: $result"
-}
-
-cmd_logs() {
-    local name="${1:-}"
-
-    if [[ -z "$name" ]]; then
-        name="$(get_current_profile 2>/dev/null || true)"
-    fi
-
-    [[ -n "$name" ]] || die "没有当前配置"
-    profile_exists "$name" || die "配置不存在: $name"
-
-    local logfile
-    logfile="$(log_file "$name")"
-
-    touch "$logfile"
-
-    echo "日志: $logfile"
-    echo "Ctrl+C 退出"
-    echo
-
-    tail -f "$logfile"
+    [[ "$found" == "yes" ]] || printf 'No profiles.\n'
 }
 
 cmd_show() {
     local name="${1:-}"
+    [[ -n "$name" ]] || name="$(get_current_profile 2>/dev/null || true)"
+    [[ -n "$name" ]] || { printf 'no current profile\n' >&2; return "$EXIT_USAGE"; }
+    profile_exists "$name" || { printf 'profile does not exist: %s\n' "$name" >&2; return "$EXIT_USAGE"; }
+    load_profile "$name" || return $?
 
-    if [[ -z "$name" ]]; then
-        name="$(get_current_profile 2>/dev/null || true)"
+    if [[ "$PROFILE_VERSION" == "1" ]]; then
+        printf 'Profile Version: 1 (legacy mapped in memory)\n'
+    else
+        printf 'Profile Version: %s\n' "$PROFILE_VERSION"
     fi
+    printf 'SSH Host:        %s\n' "$HOST"
+    printf 'SSH User:        %s\n' "$USER_NAME"
+    printf 'SSH Port:        %s\n' "$SSH_PORT"
+    printf 'Private Key:     %s\n' "${KEY:-<ssh-agent/default>}"
+    printf 'Listen:          %s\n' "$(format_endpoint "$LISTEN_HOST" "$LISTEN_PORT")"
+    printf 'Client Proxy:    %s\n' "$(format_socks_uri "$CLIENT_HOST" "$CLIENT_PORT")"
+    printf 'Auto Activate:   %s\n' "$AUTO_ACTIVATE"
+}
 
-    [[ -n "$name" ]] || die "没有当前配置"
-    profile_exists "$name" || die "配置不存在: $name"
+valid_ip_result() {
+    local value="$1"
+    if [[ "$value" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+        local IFS=.
+        local -a octets
+        read -r -a octets <<<"$value"
+        local o
+        for o in "${octets[@]}"; do
+            ((10#$o <= 255)) || return 1
+        done
+        return 0
+    fi
+    [[ "$value" == *:* && "$value" =~ ^[0-9A-Fa-f:.]+$ ]]
+}
 
-    load_profile "$name"
+cmd_test() {
+    local name="${1:-}"
+    require_commands curl pgrep ss nc readlink grep awk od || return $?
+    [[ -n "$name" ]] || name="$(get_current_profile 2>/dev/null || true)"
+    [[ -n "$name" ]] || { printf 'no current profile\n' >&2; return "$EXIT_USAGE"; }
+    profile_exists "$name" || { printf 'profile does not exist: %s\n' "$name" >&2; return "$EXIT_USAGE"; }
+    load_profile "$name" || return $?
+    tunnel_state_for "$name" >/dev/null 2>&1 || true
+    [[ "$TUNNEL_STATE" == "READY" ]] || { printf 'tunnel is not READY: %s\n' "$TUNNEL_STATE" >&2; return "$EXIT_OPERATIONAL"; }
+    probe_endpoint "$CLIENT_HOST" "$CLIENT_PORT" || { printf 'client endpoint is not reachable\n' >&2; return "$EXIT_OPERATIONAL"; }
 
-    echo "Profile:      $name"
-    echo "SSH Host:     $HOST"
-    echo "SSH User:     $USER_NAME"
-    echo "SSH Port:     $SSH_PORT"
-    echo "Private Key:  ${KEY:-<ssh-agent/default>}"
-    echo "Bind Address: $BIND"
-    echo "SOCKS Port:   $PORT"
+    local proxy result="" provider
+    proxy="$(format_socks_uri "$CLIENT_HOST" "$CLIENT_PORT")"
+    for provider in https://api.ipify.org https://ifconfig.me/ip; do
+        result="$(curl -fsS --connect-timeout 8 --max-time 20 --proxy "$proxy" "$provider" 2>/dev/null || true)"
+        result="${result//$'\r'/}"
+        result="${result//$'\n'/}"
+        [[ -n "$result" ]] && break
+    done
+    valid_ip_result "$result" || { printf 'end-to-end SOCKS test failed\n' >&2; return "$EXIT_OPERATIONAL"; }
+    printf 'Connection OK\nExit IP: %s\n' "$result"
+}
+
+cmd_logs() {
+    local name="${1:-}"
+    [[ -n "$name" ]] || name="$(get_current_profile 2>/dev/null || true)"
+    [[ -n "$name" ]] || { printf 'no current profile\n' >&2; return "$EXIT_USAGE"; }
+    profile_exists "$name" || { printf 'profile does not exist: %s\n' "$name" >&2; return "$EXIT_USAGE"; }
+    local log
+    log="$(log_file "$name")"
+    touch "$log" || return "$EXIT_OPERATIONAL"
+    chmod 600 "$log" 2>/dev/null || true
+    tail -f "$log"
 }
 
 cmd_stop_all() {
-    local file
-    local found="no"
-
+    require_commands flock readlink grep awk od || return $?
+    local file found="no" rc=0
+    local LC_ALL=C
     for file in "$PROFILE_DIR"/*.conf; do
         [[ -e "$file" ]] || continue
-
         local name
         name="$(basename "$file" .conf)"
-
-        if is_running "$name"; then
+        if [[ -f "$(state_file "$name")" ]]; then
             found="yes"
-            stop_profile "$name"
+            with_profile_lock "$name" _stop_locked "$name" || rc=$?
+            ((rc == 0)) || return "$rc"
         fi
     done
+    [[ "$found" == "yes" ]] || printf 'No running profiles.\n'
+}
 
-    if [[ "$found" == "no" ]]; then
-        echo "没有正在运行的代理。"
+cmd_machine() {
+    local sub="$1"
+    shift
+    case "$sub" in
+        current)
+            (($# == 0)) || return "$EXIT_USAGE"
+            get_current_profile
+            ;;
+        activation)
+            (($# == 1)) || return "$EXIT_USAGE"
+            local name="$1"
+            profile_exists "$name" || return "$EXIT_USAGE"
+            load_profile "$name" >/dev/null || return $?
+            printf '%s\n%s\n%s\n' "$AUTO_ACTIVATE" "$CLIENT_HOST" "$CLIENT_PORT"
+            ;;
+        tunnel-state)
+            (($# == 1)) || return "$EXIT_USAGE"
+            local name="$1"
+            profile_exists "$name" || return "$EXIT_USAGE"
+            require_commands pgrep ss nc readlink grep awk od >/dev/null || return $?
+            tunnel_state_for "$name" >/dev/null 2>&1 || true
+            printf '%s\n' "$TUNNEL_STATE"
+            [[ "$TUNNEL_STATE" == "UNKNOWN" ]] && return "$EXIT_STATE"
+            return 0
+            ;;
+        *)
+            return "$EXIT_USAGE"
+            ;;
+    esac
+}
+
+cmd_exec() {
+    local name="$1"
+    shift
+    [[ "${1:-}" == "--" ]] || { printf 'usage: socksctl exec <profile> -- <command> [args...]\n' >&2; return "$EXIT_USAGE"; }
+    shift
+    (($# > 0)) || { printf 'exec command is required\n' >&2; return "$EXIT_USAGE"; }
+
+    profile_exists "$name" || { printf 'exec precondition: profile does not exist\n' >&2; return "$EXIT_EXEC_PRECONDITION"; }
+    require_commands pgrep ss nc readlink grep awk od >/dev/null || return "$EXIT_DEPENDENCY"
+    load_profile "$name" >/dev/null || return "$EXIT_EXEC_PRECONDITION"
+    tunnel_state_for "$name" >/dev/null 2>&1 || true
+    [[ "$TUNNEL_STATE" == "READY" ]] || { printf 'exec precondition: tunnel is %s\n' "$TUNNEL_STATE" >&2; return "$EXIT_EXEC_PRECONDITION"; }
+    probe_endpoint "$CLIENT_HOST" "$CLIENT_PORT" || { printf 'exec precondition: client endpoint unreachable\n' >&2; return "$EXIT_EXEC_PRECONDITION"; }
+
+    local uri no_proxy_value
+    uri="$(format_socks_uri "$CLIENT_HOST" "$CLIENT_PORT")"
+    no_proxy_value="${SOCKSCTL_NO_PROXY-localhost,127.0.0.1,::1,.local}"
+
+    (
+        unset http_proxy HTTP_PROXY https_proxy HTTPS_PROXY ftp_proxy FTP_PROXY
+        export all_proxy="$uri" ALL_PROXY="$uri" socks_proxy="$uri" SOCKS_PROXY="$uri"
+        export no_proxy="$no_proxy_value" NO_PROXY="$no_proxy_value"
+        "$@"
+    )
+}
+
+print_shell_init_bash() {
+    cat <<'SHELL_EOF'
+# socksctl Bash integration. Generated by: socksctl shell-init bash
+declare -A __SOCKSCTL_SNAPSHOT_STATE=()
+declare -A __SOCKSCTL_SNAPSHOT_VALUE=()
+__SOCKSCTL_SNAPSHOT_VALID=0
+
+__socksctl_managed_vars() {
+    printf '%s\n' \
+        http_proxy HTTP_PROXY https_proxy HTTPS_PROXY ftp_proxy FTP_PROXY \
+        all_proxy ALL_PROXY socks_proxy SOCKS_PROXY no_proxy NO_PROXY
+}
+
+__socksctl_capture_var() {
+    local var="$1" state_name="$2" value_name="$3"
+    local decl=""
+    if decl="$(declare -p "$var" 2>/dev/null)"; then
+        if [[ "$decl" =~ ^declare\ -[^[:space:]]*x ]]; then
+            printf -v "$state_name" '%s' exported
+        else
+            printf -v "$state_name" '%s' set-unexported
+        fi
+        printf -v "$value_name" '%s' "${!var}"
+    else
+        printf -v "$state_name" '%s' unset
+        printf -v "$value_name" '%s' ""
     fi
+}
+
+__socksctl_restore_var() {
+    local var="$1" state="$2" value="$3"
+    unset "$var" 2>/dev/null || return 1
+    case "$state" in
+        unset) return 0 ;;
+        set-unexported)
+            printf -v "$var" '%s' "$value" || return 1
+            export -n "$var" 2>/dev/null || true
+            ;;
+        exported)
+            printf -v "$var" '%s' "$value" || return 1
+            export "$var" || return 1
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+__socksctl_assign_exported() {
+    local var="$1" value="$2"
+    printf -v "$var" '%s' "$value" 2>/dev/null || return 1
+    export "$var" || return 1
+}
+
+__socksctl_readonly_preflight() {
+    local var decl
+    while IFS= read -r var; do
+        decl="$(declare -p "$var" 2>/dev/null || true)"
+        if [[ "$decl" =~ ^declare\ -[^[:space:]]*r ]]; then
+            printf 'socksctl: managed variable is readonly: %s\n' "$var" >&2
+            return 1
+        fi
+    done < <(__socksctl_managed_vars)
+    decl="$(declare -p SOCKSCTL_ACTIVE_PROFILE 2>/dev/null || true)"
+    if [[ "$decl" =~ ^declare\ -[^[:space:]]*r ]]; then
+        printf 'socksctl: SOCKSCTL_ACTIVE_PROFILE is readonly\n' >&2
+        return 1
+    fi
+}
+
+__socksctl_capture_base_snapshot() {
+    local var state value
+    while IFS= read -r var; do
+        __socksctl_capture_var "$var" state value
+        __SOCKSCTL_SNAPSHOT_STATE["$var"]="$state"
+        __SOCKSCTL_SNAPSHOT_VALUE["$var"]="$value"
+    done < <(__socksctl_managed_vars)
+    __SOCKSCTL_SNAPSHOT_VALID=1
+}
+
+__socksctl_restore_base_snapshot() {
+    local var state value rc=0
+    ((__SOCKSCTL_SNAPSHOT_VALID == 1)) || return 0
+    while IFS= read -r var; do
+        state="${__SOCKSCTL_SNAPSHOT_STATE[$var]-unset}"
+        value="${__SOCKSCTL_SNAPSHOT_VALUE[$var]-}"
+        __socksctl_restore_var "$var" "$state" "$value" || rc=1
+    done < <(__socksctl_managed_vars)
+    unset SOCKSCTL_ACTIVE_PROFILE 2>/dev/null || rc=1
+    export -n SOCKSCTL_ACTIVE_PROFILE 2>/dev/null || true
+    __SOCKSCTL_SNAPSHOT_STATE=()
+    __SOCKSCTL_SNAPSHOT_VALUE=()
+    __SOCKSCTL_SNAPSHOT_VALID=0
+    return "$rc"
+}
+
+__socksctl_activate() {
+    local profile="${1:-}"
+    if [[ -z "$profile" ]]; then
+        profile="$(command socksctl machine current)" || {
+            printf 'socksctl: no current profile\n' >&2
+            return 1
+        }
+    fi
+
+    local tunnel
+    tunnel="$(command socksctl machine tunnel-state "$profile")" || return $?
+    [[ "$tunnel" == READY ]] || {
+        printf 'socksctl: tunnel is not READY: %s\n' "$tunnel" >&2
+        return 1
+    }
+
+    local meta auto host port extra
+    meta="$(command socksctl machine activation "$profile")" || return $?
+    {
+        IFS= read -r auto
+        IFS= read -r host
+        IFS= read -r port
+        IFS= read -r extra || true
+    } <<<"$meta"
+    [[ -n "$host" && "$port" =~ ^[0-9]+$ ]] || {
+        printf 'socksctl: invalid activation metadata\n' >&2
+        return 1
+    }
+    ((10#$port >= 1 && 10#$port <= 65535)) || {
+        printf 'socksctl: invalid activation metadata\n' >&2
+        return 1
+    }
+
+    command nc -z -w 1 "$host" "$port" >/dev/null 2>&1 || {
+        printf 'socksctl: client endpoint is unreachable\n' >&2
+        return 1
+    }
+    __socksctl_readonly_preflight || return 1
+
+    local -A tx_state=()
+    local -A tx_value=()
+    local var state value
+    while IFS= read -r var; do
+        __socksctl_capture_var "$var" state value
+        tx_state["$var"]="$state"
+        tx_value["$var"]="$value"
+    done < <(__socksctl_managed_vars)
+    local old_active="${SOCKSCTL_ACTIVE_PROFILE-}"
+    local old_active_set=0 old_active_exported=0
+    if declare -p SOCKSCTL_ACTIVE_PROFILE >/dev/null 2>&1; then
+        old_active_set=1
+        [[ "$(declare -p SOCKSCTL_ACTIVE_PROFILE 2>/dev/null)" =~ ^declare\ -[^[:space:]]*x ]] && old_active_exported=1
+    fi
+
+    local had_base_snapshot="$__SOCKSCTL_SNAPSHOT_VALID"
+    if ((__SOCKSCTL_SNAPSHOT_VALID == 0)); then
+        __socksctl_capture_base_snapshot
+    fi
+
+    local uri
+    if [[ "$host" == *:* && "$host" != \[*\] ]]; then
+        uri="socks5h://[$host]:$port"
+    else
+        uri="socks5h://$host:$port"
+    fi
+    local no_proxy_value="${SOCKSCTL_NO_PROXY-localhost,127.0.0.1,::1,.local}"
+    local failed=0
+
+    for var in http_proxy HTTP_PROXY https_proxy HTTPS_PROXY ftp_proxy FTP_PROXY; do
+        unset "$var" 2>/dev/null || { failed=1; break; }
+    done
+    if ((failed == 0)); then
+        for var in all_proxy ALL_PROXY socks_proxy SOCKS_PROXY; do
+            __socksctl_assign_exported "$var" "$uri" || { failed=1; break; }
+        done
+    fi
+    if ((failed == 0)); then
+        for var in no_proxy NO_PROXY; do
+            __socksctl_assign_exported "$var" "$no_proxy_value" || { failed=1; break; }
+        done
+    fi
+    if ((failed == 0)); then
+        SOCKSCTL_ACTIVE_PROFILE="$profile" 2>/dev/null || failed=1
+        export -n SOCKSCTL_ACTIVE_PROFILE 2>/dev/null || true
+    fi
+
+    if ((failed != 0)); then
+        while IFS= read -r var; do
+            __socksctl_restore_var "$var" "${tx_state[$var]-unset}" "${tx_value[$var]-}" || true
+        done < <(__socksctl_managed_vars)
+        if ((old_active_set == 1)); then
+            SOCKSCTL_ACTIVE_PROFILE="$old_active" 2>/dev/null || true
+            if ((old_active_exported == 1)); then
+                export SOCKSCTL_ACTIVE_PROFILE
+            else
+                export -n SOCKSCTL_ACTIVE_PROFILE 2>/dev/null || true
+            fi
+        else
+            unset SOCKSCTL_ACTIVE_PROFILE 2>/dev/null || true
+        fi
+        if ((had_base_snapshot == 0)); then
+            __SOCKSCTL_SNAPSHOT_STATE=()
+            __SOCKSCTL_SNAPSHOT_VALUE=()
+            __SOCKSCTL_SNAPSHOT_VALID=0
+        fi
+        printf 'socksctl: shell activation failed; environment rolled back\n' >&2
+        return 1
+    fi
+}
+
+__socksctl_deactivate() {
+    if ((__SOCKSCTL_SNAPSHOT_VALID == 0)); then
+        unset SOCKSCTL_ACTIVE_PROFILE 2>/dev/null || true
+        export -n SOCKSCTL_ACTIVE_PROFILE 2>/dev/null || true
+        return 0
+    fi
+    __socksctl_restore_base_snapshot
+}
+
+socksctl() {
+    local sub="${1:-start}"
+    case "$sub" in
+        activate)
+            shift || true
+            (($# <= 1)) || { printf 'usage: socksctl activate [profile]\n' >&2; return 2; }
+            __socksctl_activate "${1:-}"
+            ;;
+        deactivate)
+            shift || true
+            (($# == 0)) || { printf 'usage: socksctl deactivate\n' >&2; return 2; }
+            __socksctl_deactivate
+            ;;
+        start)
+            command socksctl "$@"
+            local rc=$?
+            ((rc == 0)) || return "$rc"
+            local resolved meta auto
+            resolved="$(command socksctl machine current)" || return $?
+            meta="$(command socksctl machine activation "$resolved")" || return $?
+            IFS= read -r auto <<<"$meta"
+            if [[ "$auto" == shell ]]; then
+                if ! __socksctl_activate "$resolved"; then
+                    printf 'Tunnel READY, shell activation failed\n' >&2
+                    return 1
+                fi
+            fi
+            ;;
+        stop)
+            local target=""
+            if (($# == 2)); then
+                target="$2"
+            elif (($# == 1)); then
+                target="$(command socksctl machine current)" || return $?
+            else
+                command socksctl "$@"
+                return $?
+            fi
+            command socksctl "$@"
+            local rc=$?
+            ((rc == 0)) || return "$rc"
+            if [[ "${SOCKSCTL_ACTIVE_PROFILE-}" == "$target" ]]; then
+                __socksctl_deactivate
+            fi
+            ;;
+        stop-all)
+            command socksctl "$@"
+            local rc=$?
+            ((rc == 0)) || return "$rc"
+            __socksctl_deactivate
+            ;;
+        restart)
+            local target=""
+            if (($# == 2)); then
+                target="$2"
+            elif (($# == 1)); then
+                target="$(command socksctl machine current)" || return $?
+            else
+                command socksctl "$@"
+                return $?
+            fi
+            local was_active=0
+            [[ "${SOCKSCTL_ACTIVE_PROFILE-}" == "$target" ]] && was_active=1
+            command socksctl "$@"
+            local rc=$?
+            if ((rc != 0)); then
+                ((was_active == 1)) && __socksctl_deactivate
+                return "$rc"
+            fi
+            if ((was_active == 1)); then
+                __socksctl_activate "$target" || {
+                    __socksctl_deactivate
+                    return 1
+                }
+            fi
+            ;;
+        status|list)
+            SOCKSCTL_CALLER_ACTIVE_PROFILE="${SOCKSCTL_ACTIVE_PROFILE-}" command socksctl "$@"
+            ;;
+        *)
+            command socksctl "$@"
+            ;;
+    esac
+}
+SHELL_EOF
+}
+
+cmd_activate_direct() {
+    printf 'socksctl activate/deactivate must run through Bash shell integration.\n' >&2
+    # The command substitution below is intentional literal setup text.
+    # shellcheck disable=SC2016
+    printf 'Add this to ~/.bashrc: eval "$(socksctl shell-init bash)"\n' >&2
+    return "$EXIT_USAGE"
 }
 
 show_help() {
     cat <<'EOF'
-socksctl - SOCKS5 over SSH / autossh 管理工具
+socksctl - reliable SOCKS5-over-SSH manager for Linux/Bash
 
-用法:
-
-  socksctl start
-      第一次运行时创建配置。
-      以后直接启动上一次使用的配置。
-
-  socksctl start <name>
-      启动指定配置。
-      如果配置不存在，会进入创建流程。
-
-  socksctl add <name>
-      新增配置。
-      默认继承上一次配置的信息。
-
-  socksctl edit [name]
-      编辑配置。
-      不指定 name 时编辑当前配置。
-
-  socksctl remove <name>
-      删除配置。
-
-  socksctl use <name>
-      设置默认配置。
-
-  socksctl list
-      查看全部配置。
-
-  socksctl status [name]
-      查看运行状态。
-
-  socksctl show [name]
-      查看配置。
-
-  socksctl stop [name]
-      停止代理。
-
+Usage:
+  socksctl start [profile]
+  socksctl stop [profile]
+  socksctl restart [profile]
   socksctl stop-all
-      停止所有代理。
+  socksctl add [profile]
+  socksctl edit [profile]
+  socksctl remove <profile>
+  socksctl use <profile>
+  socksctl show [profile]
+  socksctl status [profile]
+  socksctl list
+  socksctl test [profile]
+  socksctl logs [profile]
+  socksctl exec <profile> -- <command> [args...]
+  socksctl shell-init bash
+  socksctl activate [profile]     # requires shell integration
+  socksctl deactivate             # requires shell integration
+  socksctl machine current
+  socksctl machine activation <profile>
+  socksctl machine tunnel-state <profile>
 
-  socksctl restart [name]
-      重启代理。
-
-  socksctl test [name]
-      通过 SOCKS5 查询公网出口 IP。
-
-  socksctl logs [name]
-      实时查看 autossh 日志。
-
-  socksctl help
-      显示帮助。
+Exit codes:
+  0 success
+  1 operational/readiness/activation failure
+  2 CLI/config validation or shell-integration-required
+  3 required dependency missing
+  4 state/lock/process-identity conflict
+  125 exec precondition failure
+  127 exec child command not found
 EOF
 }
 
-COMMAND="${1:-start}"
-ARG="${2:-}"
+main() {
+    check_platform || return $?
+    ensure_dirs
 
-case "$COMMAND" in
-    start)
-        cmd_start "$ARG"
-        ;;
-    add)
-        cmd_add "$ARG"
-        ;;
-    edit|config)
-        cmd_edit "$ARG"
-        ;;
-    remove|rm|delete)
-        cmd_remove "$ARG"
-        ;;
-    use)
-        cmd_use "$ARG"
-        ;;
-    list|ls)
-        cmd_list
-        ;;
-    status)
-        cmd_status "$ARG"
-        ;;
-    show)
-        cmd_show "$ARG"
-        ;;
-    stop)
-        cmd_stop "$ARG"
-        ;;
-    stop-all)
-        cmd_stop_all
-        ;;
-    restart)
-        cmd_restart "$ARG"
-        ;;
-    test)
-        cmd_test "$ARG"
-        ;;
-    logs|log)
-        cmd_logs "$ARG"
-        ;;
-    help|-h|--help)
-        show_help
-        ;;
-    *)
-        echo "未知命令: $COMMAND"
-        echo
-        show_help
-        exit 1
-        ;;
-esac
+    local command="${1:-start}"
+    if (($# > 0)); then
+        shift
+    fi
+
+    case "$command" in
+        start)
+            (($# <= 1)) || usage_error "usage: socksctl start [profile]"
+            cmd_start "${1:-}"
+            ;;
+        stop)
+            (($# <= 1)) || usage_error "usage: socksctl stop [profile]"
+            cmd_stop "${1:-}"
+            ;;
+        restart)
+            (($# <= 1)) || usage_error "usage: socksctl restart [profile]"
+            cmd_restart "${1:-}"
+            ;;
+        stop-all)
+            (($# == 0)) || usage_error "usage: socksctl stop-all"
+            cmd_stop_all
+            ;;
+        add)
+            (($# <= 1)) || usage_error "usage: socksctl add [profile]"
+            cmd_add "${1:-}"
+            ;;
+        edit|config)
+            (($# <= 1)) || usage_error "usage: socksctl edit [profile]"
+            cmd_edit "${1:-}"
+            ;;
+        remove|rm|delete)
+            (($# == 1)) || usage_error "usage: socksctl remove <profile>"
+            cmd_remove "$1"
+            ;;
+        use)
+            (($# == 1)) || usage_error "usage: socksctl use <profile>"
+            cmd_use "$1"
+            ;;
+        show)
+            (($# <= 1)) || usage_error "usage: socksctl show [profile]"
+            cmd_show "${1:-}"
+            ;;
+        status)
+            (($# <= 1)) || usage_error "usage: socksctl status [profile]"
+            cmd_status "${1:-}"
+            ;;
+        list|ls)
+            (($# == 0)) || usage_error "usage: socksctl list"
+            cmd_list
+            ;;
+        test)
+            (($# <= 1)) || usage_error "usage: socksctl test [profile]"
+            cmd_test "${1:-}"
+            ;;
+        logs|log)
+            (($# <= 1)) || usage_error "usage: socksctl logs [profile]"
+            cmd_logs "${1:-}"
+            ;;
+        exec)
+            (($# >= 3)) || usage_error "usage: socksctl exec <profile> -- <command> [args...]"
+            cmd_exec "$@"
+            ;;
+        shell-init)
+            if (($# != 1)) || [[ "$1" != "bash" ]]; then
+                usage_error "usage: socksctl shell-init bash"
+            fi
+            print_shell_init_bash
+            ;;
+        activate|deactivate)
+            if [[ "$command" == "activate" ]]; then
+                (($# <= 1)) || usage_error "usage: socksctl activate [profile]"
+            else
+                (($# == 0)) || usage_error "usage: socksctl deactivate"
+            fi
+            cmd_activate_direct
+            ;;
+        machine)
+            (($# >= 1)) || usage_error "usage: socksctl machine <subcommand>"
+            cmd_machine "$@"
+            ;;
+        help|-h|--help)
+            (($# == 0)) || usage_error "usage: socksctl help"
+            show_help
+            ;;
+        *)
+            usage_error "unknown command: $command"
+            ;;
+    esac
+}
+
+if [[ "${SOCKSCTL_LIB_ONLY:-0}" == "1" ]]; then
+    check_platform
+    _socksctl_init_rc=$?
+    if (( _socksctl_init_rc == 0 )); then
+        ensure_dirs
+    fi
+    if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+        exit "$_socksctl_init_rc"
+    fi
+    return "$_socksctl_init_rc"
+fi
+
+main "$@"

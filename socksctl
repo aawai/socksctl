@@ -128,6 +128,10 @@ log_file() {
     printf '%s/%s.log\n' "$STATE_DIR" "$1"
 }
 
+launch_file() {
+    printf '%s/%s.launch\n' "$STATE_DIR" "$1"
+}
+
 profile_exists() {
     valid_profile_name "$1" || return 1
     [[ -f "$(profile_file "$1")" ]]
@@ -241,6 +245,9 @@ format_endpoint() {
 is_valid_port() {
     local value="${1:-}"
     [[ "$value" =~ ^[0-9]+$ ]] || return 1
+    # Trim leading zeros before conversion to avoid overflowing Bash integers.
+    value="${value#"${value%%[!0]*}"}"
+    [[ -n "$value" && ${#value} -le 5 ]] || return 1
     ((10#$value >= 1 && 10#$value <= 65535))
 }
 
@@ -360,9 +367,60 @@ load_v2_profile() {
     validate_profile_values no
 }
 
+# Decode historical Bash %q/quoted assignment values without eval or source.
+# Supported v1 syntax is one known KEY=VALUE assignment per line.
+legacy_decode_value() {
+    local raw="$1" i ch quote="" inner
+    REPLY=""
+    if [[ "$raw" == \$\'*\' && ${#raw} -ge 3 ]]; then
+        inner="${raw:2:${#raw}-3}"
+        printf -v REPLY '%b' "$inner"
+        return 0
+    fi
+
+    for ((i = 0; i < ${#raw}; i++)); do
+        ch="${raw:i:1}"
+        case "$quote" in
+            single)
+                if [[ "$ch" == "'" ]]; then quote=""; else REPLY+="$ch"; fi
+                ;;
+            double)
+                case "$ch" in
+                    '"') quote="" ;;
+                    \\)
+                        i=$((i + 1))
+                        ((i < ${#raw})) || return 2
+                        REPLY+="${raw:i:1}"
+                        ;;
+                    *) REPLY+="$ch" ;;
+                esac
+                ;;
+            *)
+                case "$ch" in
+                    "'") quote=single ;;
+                    '"') quote=double ;;
+                    \\)
+                        i=$((i + 1))
+                        ((i < ${#raw})) || return 2
+                        REPLY+="${raw:i:1}"
+                        ;;
+                    *)
+                        [[ "$ch" != [[:space:]] ]] || return 2
+                        REPLY+="$ch"
+                        ;;
+                esac
+                ;;
+        esac
+    done
+    [[ -z "$quote" ]]
+}
+
 load_legacy_v1_profile() {
     local file="$1"
     local BIND="" PORT=""
+    local line key raw
+    local -A seen=()
+    file_contains_nul "$file" && { printf 'invalid legacy profile: NUL\n' >&2; return "$EXIT_USAGE"; }
 
     reset_config
     PROFILE_VERSION="1"
@@ -371,9 +429,23 @@ load_legacy_v1_profile() {
     SSH_PORT=""
     KEY=""
 
-    # Legacy v1 compatibility only. v2 profiles are never sourced/eval'd.
-    # shellcheck disable=SC1090
-    source "$file"
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ -z "$line" || "$line" == \#* ]] && continue
+        [[ "$line" == *=* && "$line" != *$'\r'* ]] || {
+            printf 'invalid legacy profile line\n' >&2
+            return "$EXIT_USAGE"
+        }
+        key="${line%%=*}"
+        raw="${line#*=}"
+        case "$key" in
+            HOST|USER_NAME|SSH_PORT|KEY|BIND|PORT) ;;
+            *) printf 'invalid legacy profile key: %s\n' "$key" >&2; return "$EXIT_USAGE" ;;
+        esac
+        [[ -z "${seen[$key]+x}" ]] || { printf 'duplicate legacy key: %s\n' "$key" >&2; return "$EXIT_USAGE"; }
+        seen["$key"]=1
+        legacy_decode_value "$raw" || { printf 'invalid legacy value: %s\n' "$key" >&2; return "$EXIT_USAGE"; }
+        printf -v "$key" '%s' "$REPLY"
+    done <"$file"
 
     LISTEN_HOST="$BIND"
     LISTEN_PORT="$PORT"
@@ -1008,12 +1080,39 @@ wait_existing_supervisor() {
     return "$EXIT_OPERATIONAL"
 }
 
+# Terminate the direct process we just launched before any runtime state exists.
+# Preserve the launch guard if we cannot confirm cleanup, blocking retries.
+abort_untracked_launch() {
+    local pid="$1" guard="$2" attempts=25
+    kill -TERM "$pid" 2>/dev/null || true
+    while ((attempts > 0)); do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            wait "$pid" 2>/dev/null || true
+            rm -f "$guard"
+            return 0
+        fi
+        sleep 0.1
+        attempts=$((attempts - 1))
+    done
+    kill -KILL "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    if kill -0 "$pid" 2>/dev/null; then
+        printf 'untracked autossh PID %s could not be reaped; launch guard preserved\n' "$pid" >&2
+        return "$EXIT_STATE"
+    fi
+    rm -f "$guard"
+}
+
 spawn_and_wait_ready() {
     local name="$1"
     local log
     log="$(log_file "$name")"
     : >"$log" || return "$EXIT_OPERATIONAL"
     chmod 600 "$log" 2>/dev/null || true
+
+    local launch_guard
+    launch_guard="$(launch_file "$name")"
+    atomic_write_file "$launch_guard" 600 "LAUNCH_PENDING=1"$'\n' || return "$EXIT_STATE"
 
     local bind_spec
     bind_spec="$(format_bind_spec "$LISTEN_HOST" "$LISTEN_PORT")"
@@ -1041,6 +1140,10 @@ spawn_and_wait_ready() {
     SOCKSCTL_PROFILE="$name" AUTOSSH_GATETIME=0 \
         nohup "${cmd[@]}" >>"$log" 2>&1 </dev/null &
     local pid=$!
+    if ! atomic_write_file "$launch_guard" 600 "PID=$pid"$'\n'; then
+        abort_untracked_launch "$pid" "$launch_guard" || return "$EXIT_STATE"
+        return "$EXIT_STATE"
+    fi
 
     local start_id=""
     local attempts=20
@@ -1053,11 +1156,17 @@ spawn_and_wait_ready() {
 
     if [[ -z "$start_id" ]]; then
         printf 'cannot establish process start identity for new autossh PID %s\n' "$pid" >&2
+        abort_untracked_launch "$pid" "$launch_guard" || return "$EXIT_STATE"
         tail_start_log "$name"
         return "$EXIT_STATE"
     fi
 
-    write_runtime_from_config "$name" "$pid" "$start_id" STARTING || return "$EXIT_OPERATIONAL"
+    if ! write_runtime_from_config "$name" "$pid" "$start_id" STARTING; then
+        abort_untracked_launch "$pid" "$launch_guard" || return "$EXIT_STATE"
+        printf 'cannot persist runtime state for new autossh PID %s\n' "$pid" >&2
+        return "$EXIT_OPERATIONAL"
+    fi
+    rm -f "$launch_guard" || return "$EXIT_STATE"
 
     local deadline=$((SECONDS + START_TIMEOUT))
     while ((SECONDS <= deadline)); do
@@ -1100,6 +1209,10 @@ spawn_and_wait_ready() {
 
 _start_locked() {
     local name="$1"
+    if [[ -f "$(launch_file "$name")" ]]; then
+        printf 'uncertain prior launch for %s; refusing a second autossh\n' "$name" >&2
+        return "$EXIT_STATE"
+    fi
     load_profile "$name" || {
         printf 'cannot read profile: %s\n' "$name" >&2
         return "$EXIT_USAGE"
@@ -1146,6 +1259,10 @@ _start_locked() {
 
 _stop_locked() {
     local name="$1"
+    if [[ -f "$(launch_file "$name")" ]]; then
+        printf 'uncertain prior launch for %s; refusing unsafe stop\n' "$name" >&2
+        return "$EXIT_STATE"
+    fi
     if [[ ! -f "$(state_file "$name")" ]]; then
         printf 'Already stopped: %s\n' "$name"
         return 0
@@ -1246,6 +1363,10 @@ cmd_edit() {
 
 _remove_locked() {
     local name="$1"
+    if [[ -f "$(launch_file "$name")" ]]; then
+        printf 'uncertain prior launch for %s; refusing remove\n' "$name" >&2
+        return "$EXIT_STATE"
+    fi
     local raw_current was_current="no"
     raw_current="$(get_raw_current 2>/dev/null || true)"
     [[ "$raw_current" == "$name" ]] && was_current="yes"
@@ -1453,10 +1574,14 @@ cmd_test() {
     local proxy result="" provider
     proxy="$(format_socks_uri "$CLIENT_HOST" "$CLIENT_PORT")"
     for provider in https://api.ipify.org https://ifconfig.me/ip; do
-        result="$(curl -fsS --connect-timeout 8 --max-time 20 --proxy "$proxy" "$provider" 2>/dev/null || true)"
-        result="${result//$'\r'/}"
-        result="${result//$'\n'/}"
-        [[ -n "$result" ]] && break
+        # Force proxy use regardless of NO_PROXY/no_proxy; ignore ~/.curlrc.
+        if result="$(curl -q -fsS --connect-timeout 8 --max-time 20 \
+            --noproxy '' --proxy "$proxy" "$provider" 2>/dev/null)"; then
+            result="${result//$'\r'/}"
+            result="${result//$'\n'/}"
+            valid_ip_result "$result" && break
+        fi
+        result=""
     done
     valid_ip_result "$result" || { printf 'end-to-end SOCKS test failed\n' >&2; return "$EXIT_OPERATIONAL"; }
     printf 'Connection OK\nExit IP: %s\n' "$result"
@@ -1482,7 +1607,7 @@ cmd_stop_all() {
         [[ -e "$file" ]] || continue
         local name
         name="$(basename "$file" .conf)"
-        if [[ -f "$(state_file "$name")" ]]; then
+        if [[ -f "$(state_file "$name")" || -f "$(launch_file "$name")" ]]; then
             found="yes"
             with_profile_lock "$name" _stop_locked "$name" || rc=$?
             ((rc == 0)) || return "$rc"
@@ -1551,9 +1676,12 @@ cmd_exec() {
 print_shell_init_bash() {
     cat <<'SHELL_EOF'
 # socksctl Bash integration. Generated by: socksctl shell-init bash
-declare -A __SOCKSCTL_SNAPSHOT_STATE=()
-declare -A __SOCKSCTL_SNAPSHOT_VALUE=()
-__SOCKSCTL_SNAPSHOT_VALID=0
+# Re-sourcing ~/.bashrc must not discard an active shell's original snapshot.
+if [[ "${__SOCKSCTL_SNAPSHOT_VALID:-0}" != "1" ]]; then
+    declare -A __SOCKSCTL_SNAPSHOT_STATE=()
+    declare -A __SOCKSCTL_SNAPSHOT_VALUE=()
+    __SOCKSCTL_SNAPSHOT_VALID=0
+fi
 
 __socksctl_managed_vars() {
     printf '%s\n' \
@@ -1809,8 +1937,19 @@ socksctl() {
         stop-all)
             command socksctl "$@"
             local rc=$?
-            ((rc == 0)) || return "$rc"
-            __socksctl_deactivate
+            if ((rc == 0)); then
+                __socksctl_deactivate
+                return 0
+            fi
+            # Some profiles may have stopped before a later stop failed.
+            if [[ -n "${SOCKSCTL_ACTIVE_PROFILE-}" ]]; then
+                local active_tunnel=""
+                active_tunnel="$(command socksctl machine tunnel-state "$SOCKSCTL_ACTIVE_PROFILE" 2>/dev/null)" || true
+                if [[ "$active_tunnel" != READY ]]; then
+                    __socksctl_deactivate || true
+                fi
+            fi
+            return "$rc"
             ;;
         restart)
             local target=""

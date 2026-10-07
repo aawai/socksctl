@@ -189,3 +189,44 @@ EOF
   run "$SUT" show p extra
   [ "$status" -eq 2 ]
 }
+
+@test "very long ports never overflow into valid port range" {
+  write_v2_profile huge
+  sed -i 's/LISTEN_PORT=18080/LISTEN_PORT=18446744073709569696/' "$XDG_CONFIG_HOME/socksctl/profiles/huge.conf"
+  run "$SUT" show huge
+  [ "$status" -eq 2 ]
+
+  write_v2_profile zeros
+  sed -i 's/LISTEN_PORT=18080/LISTEN_PORT=00000000000000000008080/' "$XDG_CONFIG_HOME/socksctl/profiles/zeros.conf"
+  run "$SUT" show zeros
+  [ "$status" -eq 0 ]
+}
+
+@test "legacy loader treats command substitutions as data, never executes them" {
+  local marker="$SANDBOX/legacy-executed"
+  {
+    printf 'HOST=$(touch${IFS}%s)\n' "$marker"
+    printf '%s\n' 'USER_NAME=ubuntu' 'SSH_PORT=22' "KEY=''" 'BIND=127.0.0.1' 'PORT=18080'
+  } >"$XDG_CONFIG_HOME/socksctl/profiles/legacy.conf"
+  run "$SUT" show legacy
+  [ "$status" -eq 0 ]
+  [ ! -e "$marker" ]
+}
+
+@test "legacy loader decodes backslash escaped spaces and rejects shell commands" {
+  cat >"$XDG_CONFIG_HOME/socksctl/profiles/escaped.conf" <<'EOF'
+HOST=example.com
+USER_NAME=ubuntu
+SSH_PORT=22
+KEY=~/my\ key
+BIND=127.0.0.1
+PORT=18080
+EOF
+  run "$SUT" show escaped
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"my key"* ]]
+
+  printf 'touch /tmp/never\n' >>"$XDG_CONFIG_HOME/socksctl/profiles/escaped.conf"
+  run "$SUT" show escaped
+  [ "$status" -eq 2 ]
+}

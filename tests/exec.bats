@@ -64,3 +64,47 @@ EOF
   run "$SUT" exec p -- true
   [ "$status" -eq 125 ]
 }
+
+@test "end-to-end test rejects curl failure even when stdout looks like an IP" {
+  cat >"$SANDBOX/fakebin/curl" <<'EOF'
+#!/usr/bin/env bash
+printf '203.0.113.9\n'
+exit 7
+EOF
+  chmod +x "$SANDBOX/fakebin/curl"
+
+  run "$SUT" test p
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"end-to-end SOCKS test failed"* ]]
+}
+
+@test "end-to-end test explicitly overrides inherited NO_PROXY" {
+  cat >"$SANDBOX/fakebin/curl" <<'EOF'
+#!/usr/bin/env bash
+[[ "$1" == "-q" ]] || exit 8
+seen_noproxy=0
+seen_proxy=0
+while (($#)); do
+  case "$1" in
+    --noproxy)
+      [[ "$2" == "" ]] || exit 9
+      seen_noproxy=1
+      shift 2
+      ;;
+    --proxy)
+      [[ "$2" == "socks5h://127.0.0.1:18080" ]] || exit 10
+      seen_proxy=1
+      shift 2
+      ;;
+    *) shift ;;
+  esac
+done
+[[ "$seen_noproxy" == 1 && "$seen_proxy" == 1 ]] || exit 11
+printf '203.0.113.9\n'
+EOF
+  chmod +x "$SANDBOX/fakebin/curl"
+  export NO_PROXY='*' no_proxy='*'
+  run "$SUT" test p
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Exit IP: 203.0.113.9"* ]]
+}

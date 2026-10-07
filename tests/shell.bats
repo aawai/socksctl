@@ -295,7 +295,7 @@ teardown() {
     [[ "$SOCKSCTL_ACTIVE_PROFILE" == p ]]
     socksctl deactivate
     [[ "$ALL_PROXY" == original ]]
-    [[ -z "$SOCKSCTL_ACTIVE_PROFILE" ]]
+    [[ -z "${SOCKSCTL_ACTIVE_PROFILE-}" ]]
   '
   [ "$status" -eq 0 ]
 }
@@ -310,7 +310,7 @@ teardown() {
     if socksctl stop-all; then exit 90; else rc=$?; fi
     [[ "$rc" -eq 4 ]]
     [[ "$ALL_PROXY" == original ]]
-    [[ -z "$SOCKSCTL_ACTIVE_PROFILE" ]]
+    [[ -z "${SOCKSCTL_ACTIVE_PROFILE-}" ]]
   '
   [ "$status" -eq 0 ]
 }

@@ -161,6 +161,34 @@ EOF
   [ "$status" -eq 2 ]
 }
 
+@test "machine current activation and tunnel-state have stable output" {
+  write_v2_profile p 127.0.0.1 18080 127.0.0.1 18080 none
+  make_ready_stubs
+
+  run "$SUT" machine current
+  [ "$status" -eq 1 ]
+  [ -z "$output" ]
+
+  run "$SUT" use p
+  [ "$status" -eq 0 ]
+  run "$SUT" machine current
+  [ "$status" -eq 0 ]
+  [ "$output" = "p" ]
+
+  run "$SUT" machine activation p
+  [ "$status" -eq 0 ]
+  [ "$output" = 
+  write_v2_profile p
+  run "$SUT" show p extra
+  [ "$status" -eq 2 ]
+}
+none\n127.0.0.1\n18080' ]
+
+  run "$SUT" machine tunnel-state p
+  [ "$status" -eq 0 ]
+  [ "$output" = "STOPPED" ]
+}
+
 @test "CLI rejects extra arguments" {
   write_v2_profile p
   run "$SUT" show p extra

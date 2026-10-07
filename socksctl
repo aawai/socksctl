@@ -367,9 +367,60 @@ load_v2_profile() {
     validate_profile_values no
 }
 
+# Decode historical Bash %q/quoted assignment values without eval or source.
+# Supported v1 syntax is one known KEY=VALUE assignment per line.
+legacy_decode_value() {
+    local raw="$1" i ch quote="" inner
+    REPLY=""
+    if [[ "$raw" == \$\'*\' && #{raw} -ge 3 ]]; then
+        inner="${raw:2:#{raw}-3}"
+        printf -v REPLY '%b' "$inner"
+        return 0
+    fi
+
+    for ((i = 0; i < #{raw}; i++)); do
+        ch="${raw:i:1}"
+        case "$quote" in
+            single)
+                if [[ "$ch" == "'" ]]; then quote=""; else REPLY+="$ch"; fi
+                ;;
+            double)
+                case "$ch" in
+                    '"') quote="" ;;
+                    \\)
+                        i=$((i + 1))
+                        ((i < #{raw})) || return 2
+                        REPLY+="${raw:i:1}"
+                        ;;
+                    *) REPLY+="$ch" ;;
+                esac
+                ;;
+            *)
+                case "$ch" in
+                    "'") quote=single ;;
+                    '"') quote=double ;;
+                    \\)
+                        i=$((i + 1))
+                        ((i < #{raw})) || return 2
+                        REPLY+="${raw:i:1}"
+                        ;;
+                    *)
+                        [[ "$ch" != [[:space:]] ]] || return 2
+                        REPLY+="$ch"
+                        ;;
+                esac
+                ;;
+        esac
+    done
+    [[ -z "$quote" ]]
+}
+
 load_legacy_v1_profile() {
     local file="$1"
     local BIND="" PORT=""
+    local line key raw
+    local -A seen=()
+    file_contains_nul "$file" && { printf 'invalid legacy profile: NUL\n' >&2; return "$EXIT_USAGE"; }
 
     reset_config
     PROFILE_VERSION="1"
@@ -378,9 +429,23 @@ load_legacy_v1_profile() {
     SSH_PORT=""
     KEY=""
 
-    # Legacy v1 compatibility only. v2 profiles are never sourced/eval'd.
-    # shellcheck disable=SC1090
-    source "$file"
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ -z "$line" || "$line" == \#* ]] && continue
+        [[ "$line" == *=* && "$line" != *$'\r'* ]] || {
+            printf 'invalid legacy profile line\n' >&2
+            return "$EXIT_USAGE"
+        }
+        key="${line%%=*}"
+        raw="${line#*=}"
+        case "$key" in
+            HOST|USER_NAME|SSH_PORT|KEY|BIND|PORT) ;;
+            *) printf 'invalid legacy profile key: %s\n' "$key" >&2; return "$EXIT_USAGE" ;;
+        esac
+        [[ -z "${seen[$key]+x}" ]] || { printf 'duplicate legacy key: %s\n' "$key" >&2; return "$EXIT_USAGE"; }
+        seen["$key"]=1
+        legacy_decode_value "$raw" || { printf 'invalid legacy value: %s\n' "$key" >&2; return "$EXIT_USAGE"; }
+        printf -v "$key" '%s' "$REPLY"
+    done <"$file"
 
     LISTEN_HOST="$BIND"
     LISTEN_PORT="$PORT"

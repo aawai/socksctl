@@ -173,3 +173,31 @@ teardown() {
   run "$SUT" stop p
   [ "$status" -eq 0 ]
 }
+
+@test "concurrent starts for one profile spawn only one autossh" {
+  export FAKE_READY=1
+
+  "$SUT" start p >"$SANDBOX/start-one.log" 2>&1 &
+  local first=$!
+  "$SUT" start p >"$SANDBOX/start-two.log" 2>&1 &
+  local second=$!
+
+  wait "$first"
+  wait "$second"
+  [ "$(wc -l <"$FAKE_SPAWN_COUNT")" -eq 1 ]
+
+  run "$SUT" stop p
+  [ "$status" -eq 0 ]
+}
+
+@test "remove running profile does not recursively acquire the lock" {
+  export FAKE_READY=1
+  run "$SUT" start p
+  [ "$status" -eq 0 ]
+
+  run env SOCKSCTL_ASSUME_YES=1 "$SUT" remove p
+  [ "$status" -eq 0 ]
+  [ ! -e "$XDG_CONFIG_HOME/socksctl/profiles/p.conf" ]
+  [ ! -e "$XDG_STATE_HOME/socksctl/p.state" ]
+  [ -f "$XDG_STATE_HOME/socksctl/p.lock" ]
+}

@@ -177,12 +177,7 @@ EOF
 
   run "$SUT" machine activation p
   [ "$status" -eq 0 ]
-  [ "$output" = 
-  write_v2_profile p
-  run "$SUT" show p extra
-  [ "$status" -eq 2 ]
-}
-none\n127.0.0.1\n18080' ]
+  [ "$output" = "$(printf 'none\n127.0.0.1\n18080')" ]
 
   run "$SUT" machine tunnel-state p
   [ "$status" -eq 0 ]

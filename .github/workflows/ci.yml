@@ -1,0 +1,25 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck bats
+
+      - name: Bash syntax
+        run: bash -n socksctl
+
+      - name: ShellCheck
+        run: shellcheck socksctl
+
+      - name: Bats
+        run: bats tests/

@@ -1,12 +1,14 @@
 # socksctl
 
+> **隐私说明**：README 中的公网 IP 使用 RFC 5737 文档示例地址（`192.0.2.0/24`、`198.51.100.0/24`、`203.0.113.0/24`），主机名、密钥路径、配置名称和 Docker 网关也均为示例值，不对应真实部署环境。
+
 一个轻量的、多配置的 **SOCKS5 over SSH** 管理脚本，底层使用 `autossh` 保持 SSH 动态端口转发长期在线。
 
 它适合这种场景：
 
 - 第一次运行时交互输入 SSH 服务器、用户、私钥、端口。
 - 之后再次运行时默认复用上一次使用的配置。
-- 可以追加多个出口配置，例如 `sg`、`jp`、`us`。
+- 可以追加多个出口配置，例如 `proxy-a`、`proxy-b`、`proxy-c`。
 - 不修改 `~/.ssh/config`。
 - 支持同时运行多个 SOCKS5 隧道，只要监听端口不冲突。
 - 支持启动、停止、重启、状态查看、出口 IP 测试和日志查看。
@@ -17,12 +19,12 @@
 
 ```bash
 ssh -fNT \
-  -i ~/ap-southeast \
+  -i ~/.ssh/id_ed25519 \
   -o IdentitiesOnly=yes \
   -o ServerAliveInterval=30 \
   -o ServerAliveCountMax=3 \
   -D 127.0.0.1:18080 \
-  ubuntu@47.130.28.161
+  ubuntu@203.0.113.10
 ```
 
 使用 socksctl 后，第一次只需要：
@@ -61,7 +63,7 @@ sudo apt install -y autossh curl openssh-client
 克隆仓库：
 
 ```bash
-git clone https://github.com/aawai/socksctl.git
+git clone https://github.com/OWNER/socksctl.git
 cd socksctl
 ```
 
@@ -91,15 +93,15 @@ socksctl start
 
 ```text
 未找到已有配置。
-配置名称 [default]: sg
+配置名称 [default]: proxy-a
 
-配置 SOCKS5 SSH 隧道: sg
+配置 SOCKS5 SSH 隧道: proxy-a
 直接回车保留 [] 中的默认值。
 
-SSH Host: 47.130.28.161
+SSH Host: 203.0.113.10
 SSH User [ubuntu]:
 SSH Port [22]:
-Private Key（留空则使用 ssh-agent/默认密钥）: ~/ap-southeast
+Private Key（留空则使用 ssh-agent/默认密钥）: ~/.ssh/id_ed25519
 Bind Address [127.0.0.1]:
 SOCKS Port [18080]:
 ```
@@ -108,7 +110,7 @@ SOCKS Port [18080]:
 
 ```text
 已启动
-Profile: sg
+Profile: proxy-a
 SOCKS5:  socks5h://127.0.0.1:18080
 ```
 
@@ -118,7 +120,7 @@ SOCKS5:  socks5h://127.0.0.1:18080
 socksctl start
 ```
 
-会默认启动上一次使用的 `sg` 配置。
+会默认启动上一次使用的 `proxy-a` 配置。
 
 ---
 
@@ -127,7 +129,7 @@ socksctl start
 新增一个配置：
 
 ```bash
-socksctl add jp
+socksctl add proxy-b
 ```
 
 新配置会自动继承当前配置中的：
@@ -143,17 +145,17 @@ socksctl add jp
 例如：
 
 ```text
-sg -> 127.0.0.1:18080 -> Singapore SSH server
-jp -> 127.0.0.1:18081 -> Japan SSH server
-us -> 127.0.0.1:18082 -> US SSH server
+proxy-a -> 127.0.0.1:18080 -> SSH server A
+proxy-b -> 127.0.0.1:18081 -> SSH server B
+proxy-c -> 127.0.0.1:18082 -> SSH server C
 ```
 
 多个配置可以同时运行：
 
 ```bash
-socksctl start sg
-socksctl start jp
-socksctl start us
+socksctl start proxy-a
+socksctl start proxy-b
+socksctl start proxy-c
 ```
 
 查看：
@@ -167,11 +169,11 @@ socksctl list
 ```text
     NAME             STATUS     SOCKS                    SSH
 --- ---------------- ---------- ------------------------ ----------------------------
-    sg               running    127.0.0.1:18080         ubuntu@47.130.28.161:22
-*   jp               running    127.0.0.1:18081         ubuntu@1.2.3.4:22
-    us               stopped    127.0.0.1:18082         ubuntu@5.6.7.8:22
+    proxy-a               running    127.0.0.1:18080         ubuntu@203.0.113.10:22
+*   proxy-b               running    127.0.0.1:18081         ubuntu@198.51.100.20:22
+    proxy-c               stopped    127.0.0.1:18082         ubuntu@192.0.2.30:22
 
-* 当前默认配置: jp
+* 当前默认配置: proxy-b
 ```
 
 `*` 表示当前默认配置。
@@ -185,19 +187,19 @@ socksctl list
 socksctl start
 
 # 启动指定配置
-socksctl start sg
+socksctl start proxy-a
 
 # 新增配置
-socksctl add jp
+socksctl add proxy-b
 
 # 编辑当前配置
 socksctl edit
 
 # 编辑指定配置
-socksctl edit sg
+socksctl edit proxy-a
 
 # 设置默认配置
-socksctl use sg
+socksctl use proxy-a
 
 # 查看全部配置
 socksctl list
@@ -206,31 +208,31 @@ socksctl list
 socksctl status
 
 # 查看指定配置状态
-socksctl status sg
+socksctl status proxy-a
 
 # 查看配置内容
-socksctl show sg
+socksctl show proxy-a
 
 # 停止当前配置
 socksctl stop
 
 # 停止指定配置
-socksctl stop sg
+socksctl stop proxy-a
 
 # 停止全部配置
 socksctl stop-all
 
 # 重启
-socksctl restart sg
+socksctl restart proxy-a
 
 # 测试 SOCKS5 出口 IP
-socksctl test sg
+socksctl test proxy-a
 
 # 查看实时日志
-socksctl logs sg
+socksctl logs proxy-a
 
 # 删除配置
-socksctl remove sg
+socksctl remove proxy-a
 ```
 
 ---
@@ -240,7 +242,7 @@ socksctl remove sg
 socksctl 内置出口 IP 测试：
 
 ```bash
-socksctl test sg
+socksctl test proxy-a
 ```
 
 也可以手动测试：
@@ -263,9 +265,9 @@ curl \
 ~/.config/socksctl/
 ├── current
 └── profiles/
-    ├── sg.conf
-    ├── jp.conf
-    └── us.conf
+    ├── proxy-a.conf
+    ├── proxy-b.conf
+    └── proxy-c.conf
 ```
 
 `current` 保存上一次选择的默认配置。
@@ -273,10 +275,10 @@ curl \
 单个 profile 示例：
 
 ```bash
-HOST=47.130.28.161
+HOST=203.0.113.10
 USER_NAME=ubuntu
 SSH_PORT=22
-KEY=/home/user/ap-southeast
+KEY=/home/user/.ssh/id_ed25519
 BIND=127.0.0.1
 PORT=18080
 ```
@@ -287,10 +289,10 @@ PORT=18080
 
 ```text
 ~/.local/state/socksctl/
-├── sg.pid
-├── sg.log
-├── jp.pid
-└── jp.log
+├── proxy-a.pid
+├── proxy-a.log
+├── proxy-b.pid
+└── proxy-b.log
 ```
 
 如果设置了 `XDG_CONFIG_HOME` 或 `XDG_STATE_HOME`，脚本会遵循相应的 XDG 路径。
@@ -303,7 +305,7 @@ PORT=18080
 
 ```bash
 eval "$(ssh-agent -s)"
-ssh-add ~/ap-southeast
+ssh-add ~/.ssh/id_ed25519
 ```
 
 创建 profile 时，在下面这一项直接留空：
@@ -348,16 +350,16 @@ autossh -M 0
 
 这意味着只有本机可以连接 SOCKS5 代理。
 
-如果需要让 Docker 容器通过宿主机访问 SOCKS，例如 Docker bridge 网关为 `172.30.0.1`，可以将 Bind Address 设置为：
+如果需要让 Docker 容器通过宿主机访问 SOCKS，例如 Docker bridge 网关为 `172.18.0.1`，可以将 Bind Address 设置为：
 
 ```text
-172.30.0.1
+172.18.0.1
 ```
 
 然后容器可使用：
 
 ```text
-socks5h://172.30.0.1:18080
+socks5h://172.18.0.1:18080
 ```
 
 不建议无必要地绑定：
@@ -377,16 +379,16 @@ socks5h://172.30.0.1:18080
 正确：
 
 ```text
-sg  127.0.0.1:18080
-jp  127.0.0.1:18081
-us  127.0.0.1:18082
+proxy-a  127.0.0.1:18080
+proxy-b  127.0.0.1:18081
+proxy-c  127.0.0.1:18082
 ```
 
 错误：
 
 ```text
-sg  127.0.0.1:18080
-jp  127.0.0.1:18080
+proxy-a  127.0.0.1:18080
+proxy-b  127.0.0.1:18080
 ```
 
 第二个进程会因为端口已被占用而启动失败。

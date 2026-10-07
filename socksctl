@@ -372,13 +372,13 @@ load_v2_profile() {
 legacy_decode_value() {
     local raw="$1" i ch quote="" inner
     REPLY=""
-    if [[ "$raw" == \$\'*\' && #{raw} -ge 3 ]]; then
-        inner="${raw:2:#{raw}-3}"
+    if [[ "$raw" == \$\'*\' && ${#raw} -ge 3 ]]; then
+        inner="${raw:2:${#raw}-3}"
         printf -v REPLY '%b' "$inner"
         return 0
     fi
 
-    for ((i = 0; i < #{raw}; i++)); do
+    for ((i = 0; i < ${#raw}; i++)); do
         ch="${raw:i:1}"
         case "$quote" in
             single)
@@ -389,7 +389,7 @@ legacy_decode_value() {
                     '"') quote="" ;;
                     \\)
                         i=$((i + 1))
-                        ((i < #{raw})) || return 2
+                        ((i < ${#raw})) || return 2
                         REPLY+="${raw:i:1}"
                         ;;
                     *) REPLY+="$ch" ;;
@@ -401,7 +401,7 @@ legacy_decode_value() {
                     '"') quote=double ;;
                     \\)
                         i=$((i + 1))
-                        ((i < #{raw})) || return 2
+                        ((i < ${#raw})) || return 2
                         REPLY+="${raw:i:1}"
                         ;;
                     *)

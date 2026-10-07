@@ -28,11 +28,13 @@ rm -f "$dir/exe"
 ln -s "$0" "$dir/exe"
 printf 'autossh\n' >"$dir/comm"
 printf 'SOCKSCTL_PROFILE=%s\0AUTOSSH_GATETIME=%s\0' "${SOCKSCTL_PROFILE:-}" "${AUTOSSH_GATETIME:-}" >"$dir/environ"
-{
-  printf '%s (autossh) S' "$pid"
-  for i in $(seq 1 18); do printf ' 0'; done
-  printf ' %s\n' "$start_id"
-} >"$dir/stat"
+if [[ "${FAKE_NO_STAT:-0}" != 1 ]]; then
+  {
+    printf '%s (autossh) S' "$pid"
+    for i in $(seq 1 18); do printf ' 0'; done
+    printf ' %s\n' "$start_id"
+  } >"$dir/stat"
+fi
 printf '%s %s\n' "$pid" "$child" >>"$FAKE_CHILD_FILE"
 cleanup() {
   rm -rf "$dir"
@@ -200,4 +202,47 @@ teardown() {
   [ ! -e "$XDG_CONFIG_HOME/socksctl/profiles/p.conf" ]
   [ ! -e "$XDG_STATE_HOME/socksctl/p.state" ]
   [ -f "$XDG_STATE_HOME/socksctl/p.lock" ]
+}
+
+@test "cannot get starttime: terminate child and leave no untracked launch" {
+  export FAKE_NO_STAT=1
+  run "$SUT" start p
+  [ "$status" -eq 4 ]
+  [ ! -e "$XDG_STATE_HOME/socksctl/p.launch" ]
+  [ ! -e "$XDG_STATE_HOME/socksctl/p.state" ]
+  [ "$(find "$SOCKSCTL_PROC_ROOT" -mindepth 1 -maxdepth 1 -type d | wc -l)" -eq 0 ]
+}
+
+@test "cannot persist runtime state: terminate child and remove launch guard" {
+  cat >"$SANDBOX/fakebin/mktemp" <<'EOF'
+#!/usr/bin/env bash
+countfile="$XDG_STATE_HOME/mktemp-count"
+n=0
+if [[ -f "$countfile" ]]; then read -r n <"$countfile"; fi
+n=$((n + 1))
+printf '%s\n' "$n" >"$countfile"
+if ((n == 3)); then exit 1; fi
+exec /usr/bin/mktemp "$@"
+EOF
+  chmod +x "$SANDBOX/fakebin/mktemp"
+  run "$SUT" start p
+  [ "$status" -eq 1 ]
+  [ ! -e "$XDG_STATE_HOME/socksctl/p.launch" ]
+  [ ! -e "$XDG_STATE_HOME/socksctl/p.state" ]
+  [ "$(find "$SOCKSCTL_PROC_ROOT" -mindepth 1 -maxdepth 1 -type d | wc -l)" -eq 0 ]
+}
+
+@test "uncertain previous launch refuses start stop and remove" {
+  printf 'PID=123\n' >"$XDG_STATE_HOME/socksctl/p.launch"
+
+  run "$SUT" start p
+  [ "$status" -eq 4 ]
+  [ "$(wc -l <"$FAKE_SPAWN_COUNT")" -eq 0 ]
+
+  run "$SUT" stop p
+  [ "$status" -eq 4 ]
+
+  run env SOCKSCTL_ASSUME_YES=1 "$SUT" remove p
+  [ "$status" -eq 4 ]
+  [ -f "$XDG_CONFIG_HOME/socksctl/profiles/p.conf" ]
 }

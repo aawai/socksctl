@@ -1015,12 +1015,39 @@ wait_existing_supervisor() {
     return "$EXIT_OPERATIONAL"
 }
 
+# Terminate the direct process we just launched before any runtime state exists.
+# Preserve the launch guard if we cannot confirm cleanup, blocking retries.
+abort_untracked_launch() {
+    local pid="$1" guard="$2" attempts=25
+    kill -TERM "$pid" 2>/dev/null || true
+    while ((attempts > 0)); do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            wait "$pid" 2>/dev/null || true
+            rm -f "$guard"
+            return 0
+        fi
+        sleep 0.1
+        attempts=$((attempts - 1))
+    done
+    kill -KILL "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    if kill -0 "$pid" 2>/dev/null; then
+        printf 'untracked autossh PID %s could not be reaped; launch guard preserved\n' "$pid" >&2
+        return "$EXIT_STATE"
+    fi
+    rm -f "$guard"
+}
+
 spawn_and_wait_ready() {
     local name="$1"
     local log
     log="$(log_file "$name")"
     : >"$log" || return "$EXIT_OPERATIONAL"
     chmod 600 "$log" 2>/dev/null || true
+
+    local launch_guard
+    launch_guard="$(launch_file "$name")"
+    atomic_write_file "$launch_guard" 600 "LAUNCH_PENDING=1"$'\n' || return "$EXIT_STATE"
 
     local bind_spec
     bind_spec="$(format_bind_spec "$LISTEN_HOST" "$LISTEN_PORT")"
@@ -1048,6 +1075,10 @@ spawn_and_wait_ready() {
     SOCKSCTL_PROFILE="$name" AUTOSSH_GATETIME=0 \
         nohup "${cmd[@]}" >>"$log" 2>&1 </dev/null &
     local pid=$!
+    if ! atomic_write_file "$launch_guard" 600 "PID=$pid"$'\n'; then
+        abort_untracked_launch "$pid" "$launch_guard" || return "$EXIT_STATE"
+        return "$EXIT_STATE"
+    fi
 
     local start_id=""
     local attempts=20
@@ -1060,11 +1091,17 @@ spawn_and_wait_ready() {
 
     if [[ -z "$start_id" ]]; then
         printf 'cannot establish process start identity for new autossh PID %s\n' "$pid" >&2
+        abort_untracked_launch "$pid" "$launch_guard" || return "$EXIT_STATE"
         tail_start_log "$name"
         return "$EXIT_STATE"
     fi
 
-    write_runtime_from_config "$name" "$pid" "$start_id" STARTING || return "$EXIT_OPERATIONAL"
+    if ! write_runtime_from_config "$name" "$pid" "$start_id" STARTING; then
+        abort_untracked_launch "$pid" "$launch_guard" || return "$EXIT_STATE"
+        printf 'cannot persist runtime state for new autossh PID %s\n' "$pid" >&2
+        return "$EXIT_OPERATIONAL"
+    fi
+    rm -f "$launch_guard" || return "$EXIT_STATE"
 
     local deadline=$((SECONDS + START_TIMEOUT))
     while ((SECONDS <= deadline)); do
@@ -1107,6 +1144,10 @@ spawn_and_wait_ready() {
 
 _start_locked() {
     local name="$1"
+    if [[ -f "$(launch_file "$name")" ]]; then
+        printf 'uncertain prior launch for %s; refusing a second autossh\n' "$name" >&2
+        return "$EXIT_STATE"
+    fi
     load_profile "$name" || {
         printf 'cannot read profile: %s\n' "$name" >&2
         return "$EXIT_USAGE"
@@ -1153,6 +1194,10 @@ _start_locked() {
 
 _stop_locked() {
     local name="$1"
+    if [[ -f "$(launch_file "$name")" ]]; then
+        printf 'uncertain prior launch for %s; refusing unsafe stop\n' "$name" >&2
+        return "$EXIT_STATE"
+    fi
     if [[ ! -f "$(state_file "$name")" ]]; then
         printf 'Already stopped: %s\n' "$name"
         return 0
@@ -1253,6 +1298,10 @@ cmd_edit() {
 
 _remove_locked() {
     local name="$1"
+    if [[ -f "$(launch_file "$name")" ]]; then
+        printf 'uncertain prior launch for %s; refusing remove\n' "$name" >&2
+        return "$EXIT_STATE"
+    fi
     local raw_current was_current="no"
     raw_current="$(get_raw_current 2>/dev/null || true)"
     [[ "$raw_current" == "$name" ]] && was_current="yes"
@@ -1493,7 +1542,7 @@ cmd_stop_all() {
         [[ -e "$file" ]] || continue
         local name
         name="$(basename "$file" .conf)"
-        if [[ -f "$(state_file "$name")" ]]; then
+        if [[ -f "$(state_file "$name")" || -f "$(launch_file "$name")" ]]; then
             found="yes"
             with_profile_lock "$name" _stop_locked "$name" || rc=$?
             ((rc == 0)) || return "$rc"

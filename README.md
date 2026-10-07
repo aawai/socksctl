@@ -91,6 +91,7 @@ Configuration and runtime data follow XDG paths:
 
 ~/.local/state/socksctl/
 ├── <profile>.state
+├── <profile>.launch   # present only during an uncertain in-flight start
 ├── <profile>.lock
 └── <profile>.log
 ```
@@ -110,6 +111,8 @@ Reload Bash:
 ```bash
 source ~/.bashrc
 ```
+
+Repeatedly sourcing the generated integration while a shell is active preserves the original activation snapshot; a later `deactivate` still restores the pre-activation variables.
 
 The generated wrapper calls the backend with `command socksctl ...`, so it does not recurse into itself.
 
@@ -467,7 +470,7 @@ other   -> LISTEN_HOST
 
 A v1 profile is not rewritten by `start`. The next `edit`/save writes v2.
 
-For migration compatibility only, v1 still uses the historical Bash `%q` loader. **v2 is never sourced or eval'd.** Its parser accepts only the v2 allowlist, rejects unknown/duplicate keys, and treats values as data.
+Both v1 and v2 are parsed strictly as data: **neither profile format is sourced or eval'd.** The v1 parser recognizes only the six historical assignment keys, supports normal quoted/backslash-escaped Bash `%q` values (including common ANSI-C escapes), and rejects unexpected shell commands, unknown keys and duplicates. Unsupported dynamic shell expansions are no longer evaluated; migrate such files by editing them into literal values. The v2 parser accepts only the v2 allowlist and rejects unknown/duplicate keys.
 
 ## 14. Runtime state and process identity
 
@@ -527,6 +530,8 @@ Each profile has a stable lock:
 ```
 
 `start`, `stop`, `restart`, and `remove` acquire it once with `flock`. Restart and remove call internal locked helpers rather than recursively acquiring the same lock.
+
+A transient `<profile>.launch` reservation is created **before** spawning autossh and removed once runtime state is persisted, or after failed-launch cleanup. If a process cannot be safely accounted for, the marker remains and subsequent start/stop/remove operations fail closed with exit `4`. Inspect the process and runtime logs before manually deleting a stale launch marker.
 
 Default lock timeout:
 

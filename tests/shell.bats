@@ -283,3 +283,51 @@ teardown() {
   '
   [ "$status" -eq 0 ]
 }
+
+@test "re-sourcing shell init while active preserves the original environment" {
+  run env PATH="$SANDBOX/fakebin:$PATH" INIT="$SANDBOX/init.sh" bash -c '
+    set -eu
+    export ALL_PROXY=original
+    source "$INIT"
+    socksctl activate p
+    [[ "$ALL_PROXY" == "socks5h://127.0.0.1:18080" ]]
+    source "$INIT"
+    [[ "$SOCKSCTL_ACTIVE_PROFILE" == p ]]
+    socksctl deactivate
+    [[ "$ALL_PROXY" == original ]]
+    [[ -z "$SOCKSCTL_ACTIVE_PROFILE" ]]
+  '
+  [ "$status" -eq 0 ]
+}
+
+@test "partial stop-all failure deactivates shell if active tunnel was stopped" {
+  run env PATH="$SANDBOX/fakebin:$PATH" INIT="$SANDBOX/init.sh" bash -c '
+    set -eu
+    export ALL_PROXY=original
+    source "$INIT"
+    socksctl activate p
+    export FAKE_BACKEND_RC=4 FAKE_TUNNEL_STATE=STOPPED
+    if socksctl stop-all; then exit 90; else rc=$?; fi
+    [[ "$rc" -eq 4 ]]
+    [[ "$ALL_PROXY" == original ]]
+    [[ -z "$SOCKSCTL_ACTIVE_PROFILE" ]]
+  '
+  [ "$status" -eq 0 ]
+}
+
+@test "partial stop-all failure preserves shell if active tunnel remains READY" {
+  run env PATH="$SANDBOX/fakebin:$PATH" INIT="$SANDBOX/init.sh" bash -c '
+    set -eu
+    export ALL_PROXY=original
+    source "$INIT"
+    socksctl activate p
+    export FAKE_BACKEND_RC=4 FAKE_TUNNEL_STATE=READY
+    if socksctl stop-all; then exit 90; else rc=$?; fi
+    [[ "$rc" -eq 4 ]]
+    [[ "$SOCKSCTL_ACTIVE_PROFILE" == p ]]
+    [[ "$ALL_PROXY" == "socks5h://127.0.0.1:18080" ]]
+    socksctl deactivate
+    [[ "$ALL_PROXY" == original ]]
+  '
+  [ "$status" -eq 0 ]
+}

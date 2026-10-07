@@ -70,6 +70,7 @@ teardown() {
 
     # shellcheck disable=SC1090
     source "$INIT"
+    set -x
     socksctl activate p
 
     [[ "$all_proxy" == "socks5h://127.0.0.1:18080" ]]
@@ -94,6 +95,7 @@ teardown() {
     [[ "$http_proxy" == plain ]]
     ! declare -p SOCKSCTL_ACTIVE_PROFILE >/dev/null 2>&1
   '
+  if [ "$status" -ne 0 ]; then echo "RESTORE ERROR (status=$status): $output" >&3; fi
   [ "$status" -eq 0 ]
 }
 
@@ -169,6 +171,7 @@ teardown() {
   run env PATH="$SANDBOX/fakebin:$PATH" INIT="$SANDBOX/init.sh" FAKE_AUTO=shell bash -c '
     export ALL_PROXY=before
     source "$INIT"
+    set -x
     socksctl start p
     [[ "$ALL_PROXY" == "socks5h://127.0.0.1:18080" ]]
     [[ "$SOCKSCTL_ACTIVE_PROFILE" == p ]]

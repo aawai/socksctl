@@ -6,7 +6,6 @@ umask 077
 # socksctl - Linux/Bash SOCKS5-over-SSH manager.
 # Runtime target: Linux, Bash >= 4, OpenSSH, autossh.
 
-EXIT_OK=0
 EXIT_OPERATIONAL=1
 EXIT_USAGE=2
 EXIT_DEPENDENCY=3
@@ -197,8 +196,8 @@ expand_path() {
     local value="$1"
     if [[ "$value" == "~" ]]; then
         printf '%s\n' "$HOME"
-    elif [[ "$value" == "~/"* ]]; then
-        printf '%s/%s\n' "$HOME" "${value#~/}"
+    elif [[ "${value:0:2}" == "~/" ]]; then
+        printf '%s/%s\n' "$HOME" "${value:2}"
     else
         printf '%s\n' "$value"
     fi
@@ -1039,11 +1038,12 @@ spawn_and_wait_ready() {
     local pid=$!
 
     local start_id=""
-    local i
-    for i in {1..20}; do
+    local attempts=20
+    while (( attempts > 0 )); do
         start_id="$(read_process_start_id "$pid" 2>/dev/null || true)"
         [[ -n "$start_id" ]] && break
         sleep 0.05
+        ((attempts -= 1))
     done
 
     if [[ -z "$start_id" ]]; then
@@ -1845,6 +1845,7 @@ SHELL_EOF
 
 cmd_activate_direct() {
     printf 'socksctl activate/deactivate must run through Bash shell integration.\n' >&2
+    # shellcheck disable=SC2016 -- the command substitution is intentional literal setup text.
     printf 'Add this to ~/.bashrc: eval "$(socksctl shell-init bash)"\n' >&2
     return "$EXIT_USAGE"
 }
@@ -1981,9 +1982,15 @@ main() {
 }
 
 if [[ "${SOCKSCTL_LIB_ONLY:-0}" == "1" ]]; then
-    check_platform || return $?
-    ensure_dirs
-    return 0 2>/dev/null || exit 0
+    check_platform
+    _socksctl_init_rc=$?
+    if (( _socksctl_init_rc == 0 )); then
+        ensure_dirs
+    fi
+    if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+        exit "$_socksctl_init_rc"
+    fi
+    return "$_socksctl_init_rc"
 fi
 
 main "$@"

@@ -61,9 +61,11 @@ teardown() {
     set -u
     unset all_proxy
     ALL_PROXY=""
+    export -n ALL_PROXY
     export socks_proxy=""
     export SOCKS_PROXY="before"
     http_proxy="plain"
+    export -n http_proxy
     unset HTTP_PROXY https_proxy HTTPS_PROXY ftp_proxy FTP_PROXY no_proxy NO_PROXY
 
     # shellcheck disable=SC1090
@@ -171,6 +173,7 @@ teardown() {
     [[ "$ALL_PROXY" == "socks5h://127.0.0.1:18080" ]]
     [[ "$SOCKSCTL_ACTIVE_PROFILE" == p ]]
   '
+  if [ "$status" -ne 0 ]; then echo "AUTO_ACTIVATE shell failure (status=$status): $output" >&3; fi
   [ "$status" -eq 0 ]
 }
 

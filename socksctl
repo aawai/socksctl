@@ -1,0 +1,915 @@
+#!/usr/bin/env bash
+
+set -u
+
+# ============================================================
+# socksctl
+# Simple multi-profile SOCKS5 over SSH manager using autossh
+# ============================================================
+
+CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
+STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}"
+
+CONFIG_DIR="$CONFIG_HOME/socksctl"
+PROFILE_DIR="$CONFIG_DIR/profiles"
+CURRENT_FILE="$CONFIG_DIR/current"
+
+STATE_DIR="$STATE_HOME/socksctl"
+
+DEFAULT_USER="ubuntu"
+DEFAULT_SSH_PORT="22"
+DEFAULT_BIND="127.0.0.1"
+DEFAULT_SOCKS_PORT="18080"
+
+SERVER_ALIVE_INTERVAL="30"
+SERVER_ALIVE_COUNT_MAX="3"
+CONNECT_TIMEOUT="10"
+
+mkdir -p "$PROFILE_DIR" "$STATE_DIR"
+chmod 700 "$CONFIG_DIR" "$PROFILE_DIR" "$STATE_DIR" 2>/dev/null || true
+
+die() {
+    echo "ERROR: $*" >&2
+    exit 1
+}
+
+command_exists() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+check_start_dependencies() {
+    command_exists ssh || die "ssh 未安装"
+    command_exists autossh || die "autossh 未安装，请执行: sudo apt install autossh"
+}
+
+check_test_dependencies() {
+    command_exists curl || die "curl 未安装"
+}
+
+valid_profile_name() {
+    [[ "$1" =~ ^[A-Za-z0-9._-]+$ ]]
+}
+
+profile_file() {
+    echo "$PROFILE_DIR/$1.conf"
+}
+
+pid_file() {
+    echo "$STATE_DIR/$1.pid"
+}
+
+log_file() {
+    echo "$STATE_DIR/$1.log"
+}
+
+profile_exists() {
+    [[ -f "$(profile_file "$1")" ]]
+}
+
+get_current_profile() {
+    if [[ -f "$CURRENT_FILE" ]]; then
+        local name
+        name="$(cat "$CURRENT_FILE" 2>/dev/null || true)"
+
+        if [[ -n "$name" ]] && profile_exists "$name"; then
+            echo "$name"
+            return 0
+        fi
+    fi
+
+    return 1
+}
+
+set_current_profile() {
+    local name="$1"
+    printf '%s\n' "$name" > "$CURRENT_FILE"
+    chmod 600 "$CURRENT_FILE"
+}
+
+first_profile() {
+    local file
+
+    for file in "$PROFILE_DIR"/*.conf; do
+        [[ -e "$file" ]] || continue
+        basename "$file" .conf
+        return 0
+    done
+
+    return 1
+}
+
+reset_config() {
+    HOST=""
+    USER_NAME="$DEFAULT_USER"
+    SSH_PORT="$DEFAULT_SSH_PORT"
+    KEY=""
+    BIND="$DEFAULT_BIND"
+    PORT="$DEFAULT_SOCKS_PORT"
+}
+
+load_profile() {
+    local name="$1"
+    local file
+
+    file="$(profile_file "$name")"
+
+    [[ -f "$file" ]] || return 1
+
+    reset_config
+
+    # Profile files are generated only by this script and chmod 600.
+    # shellcheck disable=SC1090
+    source "$file"
+
+    return 0
+}
+
+save_profile() {
+    local name="$1"
+    local file
+
+    file="$(profile_file "$name")"
+
+    {
+        printf 'HOST=%q\n' "$HOST"
+        printf 'USER_NAME=%q\n' "$USER_NAME"
+        printf 'SSH_PORT=%q\n' "$SSH_PORT"
+        printf 'KEY=%q\n' "$KEY"
+        printf 'BIND=%q\n' "$BIND"
+        printf 'PORT=%q\n' "$PORT"
+    } > "$file"
+
+    chmod 600 "$file"
+}
+
+expand_path() {
+    local value="$1"
+
+    if [[ "$value" == "~" ]]; then
+        echo "$HOME"
+    elif [[ "$value" == "~/"* ]]; then
+        echo "$HOME/${value#~/}"
+    else
+        echo "$value"
+    fi
+}
+
+prompt_value() {
+    local var_name="$1"
+    local label="$2"
+    local current_value="${!var_name}"
+    local entered=""
+
+    if [[ -n "$current_value" ]]; then
+        read -r -p "$label [$current_value]: " entered
+
+        if [[ -n "$entered" ]]; then
+            printf -v "$var_name" '%s' "$entered"
+        fi
+    else
+        read -r -p "$label: " entered
+
+        if [[ -n "$entered" ]]; then
+            printf -v "$var_name" '%s' "$entered"
+        fi
+    fi
+}
+
+configure_profile() {
+    local name="$1"
+    local inherit="${2:-yes}"
+
+    reset_config
+
+    # 新配置默认继承上一次使用的参数
+    if [[ "$inherit" == "yes" ]]; then
+        local current
+
+        current="$(get_current_profile 2>/dev/null || true)"
+
+        if [[ -n "$current" ]] && profile_exists "$current"; then
+            load_profile "$current"
+        fi
+    fi
+
+    echo
+    echo "配置 SOCKS5 SSH 隧道: $name"
+    echo "直接回车保留 [] 中的默认值。"
+    echo
+
+    prompt_value HOST "SSH Host"
+    prompt_value USER_NAME "SSH User"
+    prompt_value SSH_PORT "SSH Port"
+    prompt_value KEY "Private Key（留空则使用 ssh-agent/默认密钥）"
+    prompt_value BIND "Bind Address"
+    prompt_value PORT "SOCKS Port"
+
+    [[ -n "$HOST" ]] || die "SSH Host 不能为空"
+    [[ -n "$USER_NAME" ]] || die "SSH User 不能为空"
+    [[ "$SSH_PORT" =~ ^[0-9]+$ ]] || die "SSH Port 必须是数字"
+    [[ "$PORT" =~ ^[0-9]+$ ]] || die "SOCKS Port 必须是数字"
+
+    if [[ -n "$KEY" ]]; then
+        KEY="$(expand_path "$KEY")"
+
+        [[ -f "$KEY" ]] || die "找不到私钥: $KEY"
+    fi
+
+    save_profile "$name"
+    set_current_profile "$name"
+
+    echo
+    echo "已保存配置: $name"
+}
+
+profile_pid() {
+    local name="$1"
+    local file
+
+    file="$(pid_file "$name")"
+
+    [[ -f "$file" ]] || return 1
+
+    cat "$file"
+}
+
+is_running() {
+    local name="$1"
+    local pid
+
+    pid="$(profile_pid "$name" 2>/dev/null || true)"
+
+    [[ -n "$pid" ]] || return 1
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+
+    if ! kill -0 "$pid" 2>/dev/null; then
+        rm -f "$(pid_file "$name")"
+        return 1
+    fi
+
+    local comm
+    comm="$(ps -p "$pid" -o comm= 2>/dev/null | xargs || true)"
+
+    if [[ "$comm" != "autossh" ]]; then
+        rm -f "$(pid_file "$name")"
+        return 1
+    fi
+
+    return 0
+}
+
+start_profile() {
+    local name="$1"
+
+    check_start_dependencies
+
+    profile_exists "$name" || die "配置不存在: $name"
+
+    load_profile "$name" || die "无法读取配置: $name"
+
+    if is_running "$name"; then
+        set_current_profile "$name"
+
+        echo "配置 '$name' 已经运行。"
+        echo
+        echo "PID:    $(profile_pid "$name")"
+        echo "SOCKS5: socks5h://$BIND:$PORT"
+        echo "SSH:    $USER_NAME@$HOST:$SSH_PORT"
+        return 0
+    fi
+
+    if [[ -n "$KEY" && ! -f "$KEY" ]]; then
+        die "找不到私钥: $KEY"
+    fi
+
+    local log
+    local pidfile
+
+    log="$(log_file "$name")"
+    pidfile="$(pid_file "$name")"
+
+    local -a cmd
+
+    cmd=(
+        autossh
+        -M 0
+        -N
+        -T
+        -p "$SSH_PORT"
+        -o "ServerAliveInterval=$SERVER_ALIVE_INTERVAL"
+        -o "ServerAliveCountMax=$SERVER_ALIVE_COUNT_MAX"
+        -o "ExitOnForwardFailure=yes"
+        -o "ConnectTimeout=$CONNECT_TIMEOUT"
+        -o "TCPKeepAlive=yes"
+        -o "StrictHostKeyChecking=accept-new"
+    )
+
+    if [[ -n "$KEY" ]]; then
+        cmd+=(
+            -i "$KEY"
+            -o "IdentitiesOnly=yes"
+        )
+    fi
+
+    cmd+=(
+        -D "$BIND:$PORT"
+        "$USER_NAME@$HOST"
+    )
+
+    echo "正在启动 '$name' ..."
+    echo "SSH:    $USER_NAME@$HOST:$SSH_PORT"
+    echo "SOCKS5: socks5h://$BIND:$PORT"
+
+    : > "$log"
+
+    AUTOSSH_GATETIME=0 \
+    nohup "${cmd[@]}" >> "$log" 2>&1 < /dev/null &
+
+    local pid=$!
+
+    printf '%s\n' "$pid" > "$pidfile"
+    chmod 600 "$pidfile"
+
+    sleep 2
+
+    if ! is_running "$name"; then
+        rm -f "$pidfile"
+
+        echo
+        echo "启动失败。"
+        echo
+        echo "最后日志:"
+        echo "--------------------------------------------------"
+        tail -n 30 "$log" 2>/dev/null || true
+        echo "--------------------------------------------------"
+
+        return 1
+    fi
+
+    set_current_profile "$name"
+
+    echo
+    echo "已启动"
+    echo "Profile: $name"
+    echo "PID:     $pid"
+    echo "SOCKS5:  socks5h://$BIND:$PORT"
+}
+
+stop_profile() {
+    local name="$1"
+
+    profile_exists "$name" || die "配置不存在: $name"
+
+    if ! is_running "$name"; then
+        rm -f "$(pid_file "$name")"
+        echo "'$name' 未运行。"
+        return 0
+    fi
+
+    local pid
+    local children
+
+    pid="$(profile_pid "$name")"
+
+    echo "正在停止 '$name' (PID $pid)..."
+
+    children="$(pgrep -P "$pid" 2>/dev/null || true)"
+
+    kill "$pid" 2>/dev/null || true
+
+    if [[ -n "$children" ]]; then
+        kill $children 2>/dev/null || true
+    fi
+
+    local i
+
+    for i in {1..30}; do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            break
+        fi
+
+        sleep 0.1
+    done
+
+    if kill -0 "$pid" 2>/dev/null; then
+        kill -9 "$pid" 2>/dev/null || true
+    fi
+
+    rm -f "$(pid_file "$name")"
+
+    echo "已停止 '$name'。"
+}
+
+cmd_start() {
+    local name="${1:-}"
+
+    if [[ -z "$name" ]]; then
+        name="$(get_current_profile 2>/dev/null || true)"
+    fi
+
+    if [[ -z "$name" ]]; then
+        local suggested="default"
+        local entered=""
+
+        echo "未找到已有配置。"
+        read -r -p "配置名称 [$suggested]: " entered
+
+        name="${entered:-$suggested}"
+
+        valid_profile_name "$name" ||
+            die "配置名称只能包含字母、数字、点、下划线和横线"
+
+        configure_profile "$name" "no"
+    fi
+
+    if ! profile_exists "$name"; then
+        valid_profile_name "$name" ||
+            die "无效配置名称: $name"
+
+        echo "配置 '$name' 不存在，将创建新配置。"
+        configure_profile "$name" "yes"
+    fi
+
+    start_profile "$name"
+}
+
+cmd_add() {
+    local name="${1:-}"
+
+    if [[ -z "$name" ]]; then
+        read -r -p "新配置名称: " name
+    fi
+
+    [[ -n "$name" ]] || die "必须指定配置名称"
+
+    valid_profile_name "$name" ||
+        die "配置名称只能包含字母、数字、点、下划线和横线"
+
+    if profile_exists "$name"; then
+        die "配置已经存在: $name"
+    fi
+
+    configure_profile "$name" "yes"
+
+    echo
+    echo "启动该配置:"
+    echo "  socksctl start $name"
+}
+
+cmd_edit() {
+    local name="${1:-}"
+
+    if [[ -z "$name" ]]; then
+        name="$(get_current_profile 2>/dev/null || true)"
+    fi
+
+    [[ -n "$name" ]] || die "没有当前配置"
+    profile_exists "$name" || die "配置不存在: $name"
+
+    local was_running="no"
+
+    if is_running "$name"; then
+        was_running="yes"
+    fi
+
+    load_profile "$name"
+
+    echo
+    echo "编辑配置: $name"
+    echo "直接回车保留原值。"
+    echo
+
+    prompt_value HOST "SSH Host"
+    prompt_value USER_NAME "SSH User"
+    prompt_value SSH_PORT "SSH Port"
+    prompt_value KEY "Private Key"
+    prompt_value BIND "Bind Address"
+    prompt_value PORT "SOCKS Port"
+
+    [[ -n "$HOST" ]] || die "SSH Host 不能为空"
+    [[ "$SSH_PORT" =~ ^[0-9]+$ ]] || die "SSH Port 必须是数字"
+    [[ "$PORT" =~ ^[0-9]+$ ]] || die "SOCKS Port 必须是数字"
+
+    if [[ -n "$KEY" ]]; then
+        KEY="$(expand_path "$KEY")"
+        [[ -f "$KEY" ]] || die "找不到私钥: $KEY"
+    fi
+
+    save_profile "$name"
+    set_current_profile "$name"
+
+    echo
+    echo "配置已保存。"
+
+    if [[ "$was_running" == "yes" ]]; then
+        echo
+        echo "注意：'$name' 当前正在运行。"
+        echo "执行以下命令使新配置生效:"
+        echo
+        echo "  socksctl restart $name"
+    fi
+}
+
+cmd_remove() {
+    local name="${1:-}"
+
+    [[ -n "$name" ]] || die "用法: socksctl remove <name>"
+    profile_exists "$name" || die "配置不存在: $name"
+
+    if is_running "$name"; then
+        read -r -p "'$name' 正在运行，是否停止并删除？[y/N]: " answer
+
+        case "$answer" in
+            y|Y|yes|YES)
+                stop_profile "$name"
+                ;;
+            *)
+                echo "已取消。"
+                return 0
+                ;;
+        esac
+    fi
+
+    rm -f "$(profile_file "$name")"
+    rm -f "$(pid_file "$name")"
+    rm -f "$(log_file "$name")"
+
+    local current
+    current="$(get_current_profile 2>/dev/null || true)"
+
+    if [[ "$current" == "$name" ]]; then
+        rm -f "$CURRENT_FILE"
+
+        local next
+        next="$(first_profile 2>/dev/null || true)"
+
+        if [[ -n "$next" ]]; then
+            set_current_profile "$next"
+        fi
+    fi
+
+    echo "已删除配置: $name"
+}
+
+cmd_stop() {
+    local name="${1:-}"
+
+    if [[ -z "$name" ]]; then
+        name="$(get_current_profile 2>/dev/null || true)"
+    fi
+
+    [[ -n "$name" ]] || die "没有当前配置"
+
+    stop_profile "$name"
+}
+
+cmd_restart() {
+    local name="${1:-}"
+
+    if [[ -z "$name" ]]; then
+        name="$(get_current_profile 2>/dev/null || true)"
+    fi
+
+    [[ -n "$name" ]] || die "没有当前配置"
+    profile_exists "$name" || die "配置不存在: $name"
+
+    stop_profile "$name"
+    start_profile "$name"
+}
+
+cmd_use() {
+    local name="${1:-}"
+
+    [[ -n "$name" ]] || die "用法: socksctl use <name>"
+    profile_exists "$name" || die "配置不存在: $name"
+
+    set_current_profile "$name"
+
+    echo "当前默认配置已切换为: $name"
+}
+
+print_status() {
+    local name="$1"
+
+    profile_exists "$name" || die "配置不存在: $name"
+
+    load_profile "$name"
+
+    echo "Profile: $name"
+
+    if is_running "$name"; then
+        echo "Status:  RUNNING"
+        echo "PID:     $(profile_pid "$name")"
+    else
+        echo "Status:  STOPPED"
+    fi
+
+    echo "SSH:     $USER_NAME@$HOST:$SSH_PORT"
+    echo "SOCKS5:  socks5h://$BIND:$PORT"
+
+    if [[ -n "$KEY" ]]; then
+        echo "Key:     $KEY"
+    else
+        echo "Key:     ssh-agent / default"
+    fi
+}
+
+cmd_status() {
+    local name="${1:-}"
+
+    if [[ -z "$name" ]]; then
+        name="$(get_current_profile 2>/dev/null || true)"
+    fi
+
+    [[ -n "$name" ]] || die "没有当前配置"
+
+    print_status "$name"
+}
+
+cmd_list() {
+    local current
+    current="$(get_current_profile 2>/dev/null || true)"
+
+    printf "%-3s %-16s %-10s %-24s %-28s\n" \
+        "" "NAME" "STATUS" "SOCKS" "SSH"
+
+    printf "%-3s %-16s %-10s %-24s %-28s\n" \
+        "---" "----------------" "----------" "------------------------" "----------------------------"
+
+    local found="no"
+    local file
+
+    for file in "$PROFILE_DIR"/*.conf; do
+        [[ -e "$file" ]] || continue
+
+        found="yes"
+
+        local name
+        local marker=""
+
+        name="$(basename "$file" .conf)"
+
+        load_profile "$name"
+
+        local status="stopped"
+
+        if is_running "$name"; then
+            status="running"
+        fi
+
+        if [[ "$name" == "$current" ]]; then
+            marker="*"
+        fi
+
+        printf "%-3s %-16s %-10s %-24s %-28s\n" \
+            "$marker" \
+            "$name" \
+            "$status" \
+            "$BIND:$PORT" \
+            "$USER_NAME@$HOST:$SSH_PORT"
+    done
+
+    if [[ "$found" == "no" ]]; then
+        echo "没有配置。"
+        return
+    fi
+
+    echo
+
+    if [[ -n "$current" ]]; then
+        echo "* 当前默认配置: $current"
+    fi
+}
+
+cmd_test() {
+    local name="${1:-}"
+
+    check_test_dependencies
+
+    if [[ -z "$name" ]]; then
+        name="$(get_current_profile 2>/dev/null || true)"
+    fi
+
+    [[ -n "$name" ]] || die "没有当前配置"
+    profile_exists "$name" || die "配置不存在: $name"
+
+    load_profile "$name"
+
+    if ! is_running "$name"; then
+        die "'$name' 当前没有运行"
+    fi
+
+    echo "测试配置: $name"
+    echo "SOCKS5: socks5h://$BIND:$PORT"
+    echo
+
+    local result=""
+
+    result="$(
+        curl \
+            -fsS \
+            --connect-timeout 8 \
+            --max-time 20 \
+            --proxy "socks5h://$BIND:$PORT" \
+            https://api.ipify.org \
+            2>/dev/null || true
+    )"
+
+    if [[ -z "$result" ]]; then
+        result="$(
+            curl \
+                -fsS \
+                --connect-timeout 8 \
+                --max-time 20 \
+                --proxy "socks5h://$BIND:$PORT" \
+                https://ifconfig.me/ip \
+                2>/dev/null || true
+        )"
+    fi
+
+    if [[ -z "$result" ]]; then
+        echo "测试失败。"
+        echo
+        echo "查看日志:"
+        echo "  socksctl logs $name"
+        return 1
+    fi
+
+    echo "连接正常"
+    echo "出口 IP: $result"
+}
+
+cmd_logs() {
+    local name="${1:-}"
+
+    if [[ -z "$name" ]]; then
+        name="$(get_current_profile 2>/dev/null || true)"
+    fi
+
+    [[ -n "$name" ]] || die "没有当前配置"
+    profile_exists "$name" || die "配置不存在: $name"
+
+    local logfile
+    logfile="$(log_file "$name")"
+
+    touch "$logfile"
+
+    echo "日志: $logfile"
+    echo "Ctrl+C 退出"
+    echo
+
+    tail -f "$logfile"
+}
+
+cmd_show() {
+    local name="${1:-}"
+
+    if [[ -z "$name" ]]; then
+        name="$(get_current_profile 2>/dev/null || true)"
+    fi
+
+    [[ -n "$name" ]] || die "没有当前配置"
+    profile_exists "$name" || die "配置不存在: $name"
+
+    load_profile "$name"
+
+    echo "Profile:      $name"
+    echo "SSH Host:     $HOST"
+    echo "SSH User:     $USER_NAME"
+    echo "SSH Port:     $SSH_PORT"
+    echo "Private Key:  ${KEY:-<ssh-agent/default>}"
+    echo "Bind Address: $BIND"
+    echo "SOCKS Port:   $PORT"
+}
+
+cmd_stop_all() {
+    local file
+    local found="no"
+
+    for file in "$PROFILE_DIR"/*.conf; do
+        [[ -e "$file" ]] || continue
+
+        local name
+        name="$(basename "$file" .conf)"
+
+        if is_running "$name"; then
+            found="yes"
+            stop_profile "$name"
+        fi
+    done
+
+    if [[ "$found" == "no" ]]; then
+        echo "没有正在运行的代理。"
+    fi
+}
+
+show_help() {
+    cat <<'EOF'
+socksctl - SOCKS5 over SSH / autossh 管理工具
+
+用法:
+
+  socksctl start
+      第一次运行时创建配置。
+      以后直接启动上一次使用的配置。
+
+  socksctl start <name>
+      启动指定配置。
+      如果配置不存在，会进入创建流程。
+
+  socksctl add <name>
+      新增配置。
+      默认继承上一次配置的信息。
+
+  socksctl edit [name]
+      编辑配置。
+      不指定 name 时编辑当前配置。
+
+  socksctl remove <name>
+      删除配置。
+
+  socksctl use <name>
+      设置默认配置。
+
+  socksctl list
+      查看全部配置。
+
+  socksctl status [name]
+      查看运行状态。
+
+  socksctl show [name]
+      查看配置。
+
+  socksctl stop [name]
+      停止代理。
+
+  socksctl stop-all
+      停止所有代理。
+
+  socksctl restart [name]
+      重启代理。
+
+  socksctl test [name]
+      通过 SOCKS5 查询公网出口 IP。
+
+  socksctl logs [name]
+      实时查看 autossh 日志。
+
+  socksctl help
+      显示帮助。
+EOF
+}
+
+COMMAND="${1:-start}"
+ARG="${2:-}"
+
+case "$COMMAND" in
+    start)
+        cmd_start "$ARG"
+        ;;
+    add)
+        cmd_add "$ARG"
+        ;;
+    edit|config)
+        cmd_edit "$ARG"
+        ;;
+    remove|rm|delete)
+        cmd_remove "$ARG"
+        ;;
+    use)
+        cmd_use "$ARG"
+        ;;
+    list|ls)
+        cmd_list
+        ;;
+    status)
+        cmd_status "$ARG"
+        ;;
+    show)
+        cmd_show "$ARG"
+        ;;
+    stop)
+        cmd_stop "$ARG"
+        ;;
+    stop-all)
+        cmd_stop_all
+        ;;
+    restart)
+        cmd_restart "$ARG"
+        ;;
+    test)
+        cmd_test "$ARG"
+        ;;
+    logs|log)
+        cmd_logs "$ARG"
+        ;;
+    help|-h|--help)
+        show_help
+        ;;
+    *)
+        echo "未知命令: $COMMAND"
+        echo
+        show_help
+        exit 1
+        ;;
+esac

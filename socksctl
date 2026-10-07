@@ -452,10 +452,14 @@ prompt_value() {
     local entered=""
     if [[ -n "$current_value" ]]; then
         read -r -p "$label [$current_value]: " entered || return "$EXIT_OPERATIONAL"
-        [[ -n "$entered" ]] && printf -v "$var_name" '%s' "$entered"
+        if [[ -n "$entered" ]]; then
+            printf -v "$var_name" '%s' "$entered"
+        fi
     else
         read -r -p "$label: " entered || return "$EXIT_OPERATIONAL"
-        [[ -n "$entered" ]] && printf -v "$var_name" '%s' "$entered"
+        if [[ -n "$entered" ]]; then
+            printf -v "$var_name" '%s' "$entered"
+        fi
     fi
 }
 

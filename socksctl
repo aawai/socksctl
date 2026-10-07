@@ -1845,7 +1845,8 @@ SHELL_EOF
 
 cmd_activate_direct() {
     printf 'socksctl activate/deactivate must run through Bash shell integration.\n' >&2
-    # shellcheck disable=SC2016 -- the command substitution is intentional literal setup text.
+    # The command substitution below is intentional literal setup text.
+    # shellcheck disable=SC2016
     printf 'Add this to ~/.bashrc: eval "$(socksctl shell-init bash)"\n' >&2
     return "$EXIT_USAGE"
 }

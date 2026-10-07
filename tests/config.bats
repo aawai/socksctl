@@ -151,6 +151,16 @@ EOF
   [ -f "$XDG_STATE_HOME/socksctl/current.lock" ]
 }
 
+@test "profile name cannot traverse outside the profiles directory" {
+  write_v2_profile p
+  cp "$XDG_CONFIG_HOME/socksctl/profiles/p.conf" "$XDG_CONFIG_HOME/socksctl/escape.conf"
+
+  run "$SUT" show ../escape
+  [ "$status" -eq 2 ]
+  run "$SUT" use ../escape
+  [ "$status" -eq 2 ]
+}
+
 @test "CLI rejects extra arguments" {
   write_v2_profile p
   run "$SUT" show p extra
